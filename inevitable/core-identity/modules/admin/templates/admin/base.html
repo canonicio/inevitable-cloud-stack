@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-50">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ page_title }} - Platform Forge Admin{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* Custom scrollbar */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 3px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        
+        /* Card hover animations */
+        .card-hover {
+            transition: all 0.2s ease-in-out;
+        }
+        .card-hover:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        
+        /* Sidebar transition */
+        .sidebar-transition {
+            transition: margin-left 0.3s ease-in-out;
+        }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body class="h-full" x-data="adminApp()">
+    <div class="min-h-full">
+        <!-- Left Sidebar -->
+        <nav class="fixed inset-y-0 left-0 z-50 w-64 bg-white shadow-lg transform transition-transform duration-300 ease-in-out lg:translate-x-0"
+             :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'">
+            
+            <!-- Sidebar Header -->
+            <div class="flex items-center justify-between h-16 px-6 border-b border-gray-200">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <i class="fas fa-cogs text-2xl text-indigo-600"></i>
+                    </div>
+                    <div class="ml-3">
+                        <h1 class="text-lg font-semibold text-gray-900">Platform Forge</h1>
+                        <p class="text-xs text-gray-500">Admin Console</p>
+                    </div>
+                </div>
+                <button @click="sidebarOpen = false" class="lg:hidden p-1 rounded-md text-gray-400 hover:text-gray-500">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            
+            <!-- Sidebar Content -->
+            <div class="flex-1 overflow-y-auto custom-scrollbar">
+                <div class="px-3 py-4">
+                    <!-- User Info -->
+                    <div class="mb-6 px-3 py-2 bg-gray-50 rounded-lg">
+                        <div class="flex items-center">
+                            <div class="flex-shrink-0">
+                                <div class="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center">
+                                    <span class="text-sm font-medium text-white">
+                                        {{ user.first_name[0] if user.first_name else user.email[0] }}
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="ml-3 min-w-0 flex-1">
+                                <p class="text-sm font-medium text-gray-900 truncate">
+                                    {{ user.first_name }} {{ user.last_name if user.last_name else '' }}
+                                </p>
+                                <p class="text-xs text-gray-500 truncate">{{ user.email }}</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Navigation -->
+                    <nav class="space-y-1">
+                        {% for nav_item in navigation %}
+                        <div x-data="{ open: {{ 'true' if nav_item.children and any(child.id == active_section for child in nav_item.children) else 'false' }} }">
+                            {% if nav_item.children %}
+                            <!-- Expandable Navigation Item -->
+                            <button @click="open = !open" 
+                                    class="w-full flex items-center justify-between px-3 py-2 text-sm font-medium rounded-lg text-gray-700 hover:text-gray-900 hover:bg-gray-100 group">
+                                <div class="flex items-center">
+                                    <i class="fas fa-{{ nav_item.icon }} mr-3 text-gray-400 group-hover:text-gray-500"></i>
+                                    {{ nav_item.label }}
+                                </div>
+                                <i class="fas fa-chevron-right transition-transform" :class="open ? 'rotate-90' : ''"></i>
+                            </button>
+                            <div x-show="open" x-transition class="ml-6 mt-1 space-y-1">
+                                {% for child in nav_item.children %}
+                                <a href="{{ child.url }}" 
+                                   class="flex items-center px-3 py-2 text-sm rounded-lg {% if child.id == active_section %}bg-indigo-100 text-indigo-700{% else %}text-gray-600 hover:text-gray-900 hover:bg-gray-50{% endif %}">
+                                    <i class="fas fa-{{ child.icon }} mr-3 text-gray-400"></i>
+                                    {{ child.label }}
+                                    {% if child.badge %}
+                                    <span class="ml-auto bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded-full">{{ child.badge }}</span>
+                                    {% endif %}
+                                </a>
+                                {% endfor %}
+                            </div>
+                            {% else %}
+                            <!-- Simple Navigation Item -->
+                            <a href="{{ nav_item.url }}" 
+                               class="flex items-center px-3 py-2 text-sm font-medium rounded-lg {% if nav_item.id == active_section %}bg-indigo-100 text-indigo-700{% else %}text-gray-700 hover:text-gray-900 hover:bg-gray-100{% endif %} group">
+                                <i class="fas fa-{{ nav_item.icon }} mr-3 text-gray-400 group-hover:text-gray-500"></i>
+                                {{ nav_item.label }}
+                                {% if nav_item.badge %}
+                                <span class="ml-auto bg-gray-100 text-gray-800 text-xs px-2 py-1 rounded-full">{{ nav_item.badge }}</span>
+                                {% endif %}
+                            </a>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    </nav>
+                </div>
+            </div>
+            
+            <!-- Sidebar Footer -->
+            <div class="border-t border-gray-200 p-4">
+                <div class="flex items-center justify-between">
+                    <div class="text-xs text-gray-500">
+                        Platform Forge v2.0
+                    </div>
+                    <div class="flex space-x-2">
+                        <button class="p-1 text-gray-400 hover:text-gray-500">
+                            <i class="fas fa-question-circle"></i>
+                        </button>
+                        <button class="p-1 text-gray-400 hover:text-gray-500">
+                            <i class="fas fa-cog"></i>
+                        </button>
+                        <a href="/auth/logout" class="p-1 text-gray-400 hover:text-gray-500">
+                            <i class="fas fa-sign-out-alt"></i>
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </nav>
+        
+        <!-- Main Content -->
+        <div class="lg:ml-64 sidebar-transition">
+            <!-- Top Bar -->
+            <header class="bg-white shadow-sm border-b border-gray-200">
+                <div class="flex items-center justify-between h-16 px-6">
+                    <div class="flex items-center">
+                        <button @click="sidebarOpen = true" class="lg:hidden p-2 rounded-md text-gray-400 hover:text-gray-500">
+                            <i class="fas fa-bars"></i>
+                        </button>
+                        <div class="ml-4 lg:ml-0">
+                            <h1 class="text-xl font-semibold text-gray-900">{{ page_title }}</h1>
+                            {% block breadcrumb %}{% endblock %}
+                        </div>
+                    </div>
+                    
+                    <div class="flex items-center space-x-4">
+                        <!-- Search -->
+                        <div class="relative hidden md:block">
+                            <input type="text" 
+                                   placeholder="Search..." 
+                                   class="w-64 pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
+                                   x-model="searchQuery"
+                                   @input="handleSearch">
+                            <div class="absolute left-3 top-2.5">
+                                <i class="fas fa-search text-gray-400"></i>
+                            </div>
+                        </div>
+                        
+                        <!-- Notifications -->
+                        <button class="p-2 text-gray-400 hover:text-gray-500 relative">
+                            <i class="fas fa-bell"></i>
+                            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
+                        </button>
+                        
+                        <!-- User Menu -->
+                        <div x-data="{ open: false }" class="relative">
+                            <button @click="open = !open" 
+                                    class="flex items-center space-x-2 p-2 rounded-lg hover:bg-gray-100">
+                                <div class="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center">
+                                    <span class="text-sm font-medium text-white">
+                                        {{ user.first_name[0] if user.first_name else user.email[0] }}
+                                    </span>
+                                </div>
+                                <i class="fas fa-chevron-down text-gray-400"></i>
+                            </button>
+                            
+                            <div x-show="open" @click.away="open = false" x-transition
+                                 class="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border border-gray-200 z-50">
+                                <div class="py-1">
+                                    <a href="/admin/profile" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">
+                                        <i class="fas fa-user mr-2"></i> Profile
+                                    </a>
+                                    <a href="/admin/settings" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">
+                                        <i class="fas fa-cog mr-2"></i> Settings
+                                    </a>
+                                    <div class="border-t border-gray-100"></div>
+                                    <a href="/auth/logout" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-100">
+                                        <i class="fas fa-sign-out-alt mr-2"></i> Logout
+                                    </a>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </header>
+            
+            <!-- Page Content -->
+            <main class="flex-1">
+                {% block content %}{% endblock %}
+            </main>
+        </div>
+    </div>
+    
+    <!-- Mobile Sidebar Overlay -->
+    <div x-show="sidebarOpen" 
+         @click="sidebarOpen = false" 
+         x-transition:enter="transition-opacity ease-linear duration-300"
+         x-transition:enter-start="opacity-0"
+         x-transition:enter-end="opacity-100"
+         x-transition:leave="transition-opacity ease-linear duration-300"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0"
+         class="fixed inset-0 bg-gray-600 bg-opacity-75 z-40 lg:hidden">
+    </div>
+    
+    <!-- Alpine.js App State -->
+    <script>
+        function adminApp() {
+            return {
+                sidebarOpen: false,
+                searchQuery: '',
+                
+                handleSearch() {
+                    // Implement search functionality
+                    console.log('Search:', this.searchQuery);
+                },
+                
+                showNotification(message, type = 'info') {
+                    // Implement notification system
+                    console.log(`${type}: ${message}`);
+                }
+            }
+        }
+    </script>
+    
+    {% block extra_scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,503 @@
+{% extends "admin/base.html" %}
+
+{% block breadcrumb %}
+<nav class="flex mt-1" aria-label="Breadcrumb">
+    <ol class="flex items-center space-x-4">
+        <li>
+            <div>
+                <a href="/admin/" class="text-gray-400 hover:text-gray-500">
+                    <i class="fas fa-home"></i>
+                    <span class="sr-only">Home</span>
+                </a>
+            </div>
+        </li>
+        <li>
+            <div class="flex items-center">
+                <i class="fas fa-chevron-right text-gray-300 mr-4"></i>
+                <span class="text-sm font-medium text-gray-500">{{ model_config.display_name }}</span>
+            </div>
+        </li>
+    </ol>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div class="p-6" x-data="modelListApp()">
+    
+    <!-- Header -->
+    <div class="sm:flex sm:items-center sm:justify-between mb-6">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-900">{{ model_config.display_name }}</h1>
+            {% if model_config.description %}
+            <p class="mt-1 text-sm text-gray-600">{{ model_config.description }}</p>
+            {% endif %}
+        </div>
+        <div class="mt-4 sm:mt-0 sm:ml-16 sm:flex-none">
+            {% if model_config.can_create %}
+            <a href="/admin/models/{{ model_key }}/create" 
+               class="inline-flex items-center justify-center rounded-lg border border-transparent bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+                <i class="fas fa-plus mr-2"></i>
+                Create New
+            </a>
+            {% endif %}
+        </div>
+    </div>
+    
+    <!-- Filters and Search -->
+    <div class="bg-white shadow-sm rounded-lg border border-gray-200 mb-6">
+        <div class="px-6 py-4 border-b border-gray-200">
+            <div class="sm:flex sm:items-center sm:justify-between">
+                <div class="flex-1 min-w-0">
+                    <!-- Search -->
+                    <div class="relative max-w-lg">
+                        <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <i class="fas fa-search text-gray-400"></i>
+                        </div>
+                        <input x-model="searchQuery" 
+                               @input="debouncedSearch"
+                               type="text" 
+                               class="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md leading-5 bg-white placeholder-gray-500 focus:outline-none focus:placeholder-gray-400 focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
+                               placeholder="Search {{ model_config.display_name.lower() }}...">
+                    </div>
+                </div>
+                <div class="mt-4 sm:mt-0 sm:ml-4 flex items-center space-x-2">
+                    <!-- Filters -->
+                    {% if model_config.list_filter %}
+                    <div x-data="{ open: false }" class="relative">
+                        <button @click="open = !open"
+                                class="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm bg-white text-sm font-medium text-gray-700 hover:bg-gray-50">
+                            <i class="fas fa-filter mr-2"></i>
+                            Filters
+                            <i class="fas fa-chevron-down ml-2"></i>
+                        </button>
+                        <div x-show="open" 
+                             @click.away="open = false"
+                             x-transition
+                             class="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg border border-gray-200 z-50">
+                            <div class="p-4">
+                                <div class="space-y-4">
+                                    {% for filter_field in model_config.list_filter %}
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">
+                                            {{ model_config.fields[filter_field].display_name }}
+                                        </label>
+                                        {% if model_config.fields[filter_field].widget_type == 'select' %}
+                                        <select x-model="filters.{{ filter_field }}"
+                                                class="block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                                            <option value="">All</option>
+                                            <!-- Dynamic options would be loaded here -->
+                                        </select>
+                                        {% elif model_config.fields[filter_field].widget_type == 'checkbox' %}
+                                        <div class="space-y-2">
+                                            <label class="flex items-center">
+                                                <input type="checkbox" 
+                                                       x-model="filters.{{ filter_field }}_true"
+                                                       class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                                                <span class="ml-2 text-sm text-gray-700">True</span>
+                                            </label>
+                                            <label class="flex items-center">
+                                                <input type="checkbox" 
+                                                       x-model="filters.{{ filter_field }}_false"
+                                                       class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                                                <span class="ml-2 text-sm text-gray-700">False</span>
+                                            </label>
+                                        </div>
+                                        {% else %}
+                                        <input type="text" 
+                                               x-model="filters.{{ filter_field }}"
+                                               class="block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                                        {% endif %}
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                                <div class="mt-4 flex justify-between">
+                                    <button @click="clearFilters()"
+                                            class="text-sm text-gray-500 hover:text-gray-700">
+                                        Clear Filters
+                                    </button>
+                                    <button @click="applyFilters(); open = false"
+                                            class="inline-flex items-center px-3 py-1.5 border border-transparent text-sm font-medium rounded text-white bg-indigo-600 hover:bg-indigo-700">
+                                        Apply
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- View Options -->
+                    <div class="flex border border-gray-300 rounded-md">
+                        <button @click="viewMode = 'table'"
+                                :class="viewMode === 'table' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'"
+                                class="px-3 py-2 text-sm font-medium rounded-l-md border-r border-gray-300">
+                            <i class="fas fa-table"></i>
+                        </button>
+                        <button @click="viewMode = 'cards'"
+                                :class="viewMode === 'cards' ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'"
+                                class="px-3 py-2 text-sm font-medium rounded-r-md">
+                            <i class="fas fa-th-large"></i>
+                        </button>
+                    </div>
+                    
+                    <!-- Refresh -->
+                    <button @click="loadData()"
+                            class="inline-flex items-center px-3 py-2 border border-gray-300 rounded-md shadow-sm bg-white text-sm font-medium text-gray-700 hover:bg-gray-50">
+                        <i class="fas fa-sync-alt" :class="loading ? 'animate-spin' : ''"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Table View -->
+    <div x-show="viewMode === 'table'" class="bg-white shadow-sm rounded-lg border border-gray-200">
+        <div class="overflow-hidden">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        {% for field_name in model_config.list_display %}
+                        {% set field_config = model_config.fields[field_name] %}
+                        <th scope="col" 
+                            class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100"
+                            @click="toggleSort('{{ field_name }}')"
+                            {% if field_config.is_sortable %}
+                            :class="sortBy === '{{ field_name }}' ? 'bg-gray-100' : ''"
+                            {% endif %}>
+                            <div class="flex items-center space-x-1">
+                                <span>{{ field_config.display_name }}</span>
+                                {% if field_config.is_sortable %}
+                                <span x-show="sortBy === '{{ field_name }}'">
+                                    <i :class="sortDesc ? 'fas fa-sort-down' : 'fas fa-sort-up'" class="text-gray-400"></i>
+                                </span>
+                                <span x-show="sortBy !== '{{ field_name }}'" class="text-gray-300">
+                                    <i class="fas fa-sort"></i>
+                                </span>
+                                {% endif %}
+                            </div>
+                        </th>
+                        {% endfor %}
+                        <th scope="col" class="relative px-6 py-3">
+                            <span class="sr-only">Actions</span>
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    <template x-for="item in items" :key="item.id">
+                        <tr class="hover:bg-gray-50">
+                            {% for field_name in model_config.list_display %}
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                <span x-text="formatFieldValue(item, '{{ field_name }}', '{{ model_config.fields[field_name].field_type }}')"></span>
+                            </td>
+                            {% endfor %}
+                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                <div class="flex items-center space-x-2">
+                                    <a :href="`/admin/models/{{ model_key }}/${item.id}`"
+                                       class="text-indigo-600 hover:text-indigo-900">
+                                        <i class="fas fa-eye"></i>
+                                    </a>
+                                    {% if model_config.can_update %}
+                                    <a :href="`/admin/models/{{ model_key }}/${item.id}/edit`"
+                                       class="text-yellow-600 hover:text-yellow-900">
+                                        <i class="fas fa-edit"></i>
+                                    </a>
+                                    {% endif %}
+                                    {% if model_config.can_delete %}
+                                    <button @click="deleteItem(item.id)"
+                                            class="text-red-600 hover:text-red-900">
+                                        <i class="fas fa-trash"></i>
+                                    </button>
+                                    {% endif %}
+                                </div>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+            
+            <!-- Loading State -->
+            <div x-show="loading" class="p-8 text-center">
+                <i class="fas fa-spinner fa-spin text-2xl text-gray-400 mb-2"></i>
+                <p class="text-gray-500">Loading...</p>
+            </div>
+            
+            <!-- Empty State -->
+            <div x-show="!loading && items.length === 0" class="p-8 text-center">
+                <i class="fas fa-inbox text-4xl text-gray-300 mb-4"></i>
+                <h3 class="text-lg font-medium text-gray-900 mb-2">No {{ model_config.display_name.lower() }} found</h3>
+                <p class="text-gray-500 mb-4">Get started by creating your first {{ model_config.display_name.lower() }}.</p>
+                {% if model_config.can_create %}
+                <a href="/admin/models/{{ model_key }}/create"
+                   class="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">
+                    <i class="fas fa-plus mr-2"></i>
+                    Create {{ model_config.display_name }}
+                </a>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <!-- Cards View -->
+    <div x-show="viewMode === 'cards'" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <template x-for="item in items" :key="item.id">
+            <div class="bg-white shadow-sm rounded-lg border border-gray-200 card-hover">
+                <div class="p-6">
+                    <div class="flex items-start justify-between">
+                        <div class="flex-1 min-w-0">
+                            <h3 class="text-lg font-medium text-gray-900 truncate">
+                                <span x-text="getCardTitle(item)"></span>
+                            </h3>
+                            <p class="mt-1 text-sm text-gray-500">
+                                <span x-text="getCardSubtitle(item)"></span>
+                            </p>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <a :href="`/admin/models/{{ model_key }}/${item.id}`"
+                               class="text-indigo-600 hover:text-indigo-900">
+                                <i class="fas fa-eye"></i>
+                            </a>
+                            {% if model_config.can_update %}
+                            <a :href="`/admin/models/{{ model_key }}/${item.id}/edit`"
+                               class="text-yellow-600 hover:text-yellow-900">
+                                <i class="fas fa-edit"></i>
+                            </a>
+                            {% endif %}
+                            {% if model_config.can_delete %}
+                            <button @click="deleteItem(item.id)"
+                                    class="text-red-600 hover:text-red-900">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                            {% endif %}
+                        </div>
+                    </div>
+                    
+                    <div class="mt-4 space-y-2">
+                        {% for field_name in model_config.list_display[:3] %}
+                        {% if field_name != model_config.list_display[0] %}
+                        <div class="flex justify-between text-sm">
+                            <span class="text-gray-500">{{ model_config.fields[field_name].display_name }}:</span>
+                            <span class="text-gray-900" x-text="formatFieldValue(item, '{{ field_name }}', '{{ model_config.fields[field_name].field_type }}')"></span>
+                        </div>
+                        {% endif %}
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </template>
+    </div>
+    
+    <!-- Pagination -->
+    <div x-show="totalPages > 1" class="bg-white shadow-sm rounded-lg border border-gray-200 mt-6">
+        <div class="px-6 py-4">
+            <div class="flex items-center justify-between">
+                <div class="text-sm text-gray-700">
+                    Showing <span x-text="((currentPage - 1) * pageSize) + 1"></span> to 
+                    <span x-text="Math.min(currentPage * pageSize, totalItems)"></span> of 
+                    <span x-text="totalItems"></span> results
+                </div>
+                <div class="flex items-center space-x-2">
+                    <button @click="previousPage()"
+                            :disabled="currentPage <= 1"
+                            :class="currentPage <= 1 ? 'bg-gray-100 text-gray-400' : 'bg-white text-gray-700 hover:bg-gray-50'"
+                            class="px-3 py-2 border border-gray-300 rounded-md text-sm font-medium">
+                        <i class="fas fa-chevron-left"></i>
+                        Previous
+                    </button>
+                    
+                    <template x-for="page in visiblePages" :key="page">
+                        <button @click="goToPage(page)"
+                                :class="page === currentPage ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'"
+                                class="px-3 py-2 border border-gray-300 rounded-md text-sm font-medium"
+                                x-text="page">
+                        </button>
+                    </template>
+                    
+                    <button @click="nextPage()"
+                            :disabled="currentPage >= totalPages"
+                            :class="currentPage >= totalPages ? 'bg-gray-100 text-gray-400' : 'bg-white text-gray-700 hover:bg-gray-50'"
+                            class="px-3 py-2 border border-gray-300 rounded-md text-sm font-medium">
+                        Next
+                        <i class="fas fa-chevron-right"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function modelListApp() {
+    return {
+        items: [],
+        loading: false,
+        searchQuery: '',
+        viewMode: 'table',
+        currentPage: 1,
+        pageSize: {{ model_config.page_size }},
+        totalItems: 0,
+        totalPages: 0,
+        sortBy: '',
+        sortDesc: false,
+        filters: {},
+        
+        async init() {
+            await this.loadData();
+        },
+        
+        async loadData() {
+            this.loading = true;
+            try {
+                const params = new URLSearchParams({
+                    page: this.currentPage,
+                    page_size: this.pageSize
+                });
+                
+                if (this.searchQuery) {
+                    params.append('search', this.searchQuery);
+                }
+                
+                if (this.sortBy) {
+                    params.append('sort_by', this.sortBy);
+                    params.append('sort_desc', this.sortDesc);
+                }
+                
+                // Add filters
+                for (const [key, value] of Object.entries(this.filters)) {
+                    if (value) {
+                        params.append(key, value);
+                    }
+                }
+                
+                const response = await fetch(`/api/admin/{{ model_config.table_name }}?${params}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    this.items = data.items || data;
+                    this.totalItems = data.total || this.items.length;
+                    this.totalPages = Math.ceil(this.totalItems / this.pageSize);
+                }
+            } catch (error) {
+                console.error('Failed to load data:', error);
+            } finally {
+                this.loading = false;
+            }
+        },
+        
+        debouncedSearch() {
+            clearTimeout(this.searchTimeout);
+            this.searchTimeout = setTimeout(() => {
+                this.currentPage = 1;
+                this.loadData();
+            }, 300);
+        },
+        
+        toggleSort(field) {
+            if (this.sortBy === field) {
+                this.sortDesc = !this.sortDesc;
+            } else {
+                this.sortBy = field;
+                this.sortDesc = false;
+            }
+            this.currentPage = 1;
+            this.loadData();
+        },
+        
+        applyFilters() {
+            this.currentPage = 1;
+            this.loadData();
+        },
+        
+        clearFilters() {
+            this.filters = {};
+            this.applyFilters();
+        },
+        
+        async deleteItem(id) {
+            if (!confirm('Are you sure you want to delete this item?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/admin/{{ model_config.table_name }}/${id}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    await this.loadData();
+                    // Show success notification
+                } else {
+                    alert('Failed to delete item');
+                }
+            } catch (error) {
+                console.error('Delete failed:', error);
+                alert('Failed to delete item');
+            }
+        },
+        
+        formatFieldValue(item, field, fieldType) {
+            const value = item[field];
+            
+            if (value === null || value === undefined) {
+                return '-';
+            }
+            
+            switch (fieldType) {
+                case 'datetime':
+                    return new Date(value).toLocaleString();
+                case 'boolean':
+                    return value ? 'Yes' : 'No';
+                case 'json':
+                    return typeof value === 'object' ? JSON.stringify(value) : value;
+                default:
+                    return value.toString();
+            }
+        },
+        
+        getCardTitle(item) {
+            // Use first display field as title
+            const firstField = '{{ model_config.list_display[0] }}';
+            return this.formatFieldValue(item, firstField, '{{ model_config.fields[model_config.list_display[0]].field_type }}');
+        },
+        
+        getCardSubtitle(item) {
+            // Use second display field as subtitle if available
+            {% if model_config.list_display|length > 1 %}
+            const secondField = '{{ model_config.list_display[1] }}';
+            return this.formatFieldValue(item, secondField, '{{ model_config.fields[model_config.list_display[1]].field_type }}');
+            {% else %}
+            return 'ID: ' + item.id;
+            {% endif %}
+        },
+        
+        get visiblePages() {
+            const pages = [];
+            const start = Math.max(1, this.currentPage - 2);
+            const end = Math.min(this.totalPages, this.currentPage + 2);
+            
+            for (let i = start; i <= end; i++) {
+                pages.push(i);
+            }
+            
+            return pages;
+        },
+        
+        goToPage(page) {
+            this.currentPage = page;
+            this.loadData();
+        },
+        
+        previousPage() {
+            if (this.currentPage > 1) {
+                this.currentPage--;
+                this.loadData();
+            }
+        },
+        
+        nextPage() {
+            if (this.currentPage < this.totalPages) {
+                this.currentPage++;
+                this.loadData();
+            }
+        }
+    }
+}
+</script>
+{% endblock %}

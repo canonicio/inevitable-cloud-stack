@@ -1,0 +1,602 @@
+"""
+RBAC (Role-Based Access Control) routes
+"""
+from typing import List, Optional
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+from pydantic import BaseModel, Field, field_validator
+
+from ..core.database import get_db
+from ..core.enhanced_validators import SecureBaseModel, APIParameterValidator
+from .dependencies import get_current_user, require_tenant, get_current_superuser
+from .models import User, Role, Permission, user_roles
+from .permissions import (
+    permission_service, require_permission, Resource, Action,
+    ROLE_TEMPLATES, create_default_roles
+)
+from .rbac_validator import RBACValidator
+
+router = APIRouter(prefix="/rbac", tags=["rbac"])
+
+
+class RoleCreate(SecureBaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+    permissions: List[str] = Field(default_factory=list)
+
+
+    @field_validator('description')
+    @classmethod
+    def validate_description(cls, v):
+                        if v:
+                            return APIParameterValidator.validate_no_injection(v, 'description')
+                        return v
+
+class RoleUpdate(SecureBaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+    permissions: Optional[List[str]] = None
+
+
+    @field_validator('description')
+    @classmethod
+    def validate_description(cls, v):
+                        if v:
+                            return APIParameterValidator.validate_no_injection(v, 'description')
+                        return v
+
+class PermissionCreate(SecureBaseModel):
+    name: str = Field(..., pattern="^[a-z_]+:[a-z_]+$")
+    description: Optional[str] = None
+
+
+    @field_validator('description')
+    @classmethod
+    def validate_description(cls, v):
+                        if v:
+                            return APIParameterValidator.validate_no_injection(v, 'description')
+                        return v
+
+class UserRoleAssignment(SecureBaseModel):
+    user_id: int
+    role_ids: List[int]
+
+
+# Role management
+@router.get("/roles")
+@require_permission(Resource.ROLES, Action.LIST)
+async def list_roles(
+    include_permissions: bool = False,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """List all roles in the tenant"""
+    roles = db.query(Role).filter(
+        Role.tenant_id == tenant_id
+    ).all()
+    
+    role_data = []
+    for role in roles:
+        data = {
+            "id": role.id,
+            "name": role.name,
+            "description": role.description,
+            "is_system_role": role.is_system_role,
+            "created_at": role.created_at
+        }
+        
+        if include_permissions:
+            permissions = db.query(Permission).filter(
+                Permission.role_id == role.id
+            ).all()
+            data["permissions"] = [p.name for p in permissions]
+        
+        role_data.append(data)
+    
+    return {"roles": role_data}
+
+
+@router.post("/roles")
+@require_permission(Resource.ROLES, Action.CREATE)
+async def create_role(
+    role_data: RoleCreate,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Create a new role with comprehensive validation"""
+    # Check if role name exists
+    existing = db.query(Role).filter(
+        and_(
+            Role.name == role_data.name,
+            Role.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if existing:
+        raise HTTPException(400, "Role with this name already exists")
+    
+    # SECURITY FIX: Initialize RBAC validator
+    validator = RBACValidator(db)
+    
+    # SECURITY FIX: Validate role creation with comprehensive checks
+    validator.validate_role_creation(role_data.dict(), current_user)
+    
+    # Create role
+    role = Role(
+        name=role_data.name,
+        description=role_data.description,
+        tenant_id=tenant_id,
+        is_system_role=False,
+        inherits_from=role_data.inherits_from if hasattr(role_data, 'inherits_from') else None
+    )
+    db.add(role)
+    db.flush()
+    
+    # Add permissions
+    if role_data.permissions:
+        for perm_string in role_data.permissions:
+            try:
+                resource, action = permission_service.parse_permission(perm_string)
+                permission = Permission(
+                    name=perm_string,
+                    resource=resource,
+                    action=action,
+                    role_id=role.id,
+                    tenant_id=tenant_id
+                )
+                db.add(permission)
+            except ValueError:
+                raise HTTPException(400, f"Invalid permission format: {perm_string}")
+    
+    db.commit()
+    
+    # Create comprehensive audit log
+    validator.audit_permission_change(
+        user=current_user,
+        action="role.create",
+        target_resource=f"role:{role.id}",
+        details={
+            "role_name": role.name,
+            "permissions": role_data.permissions,
+            "inherits_from": getattr(role_data, 'inherits_from', [])
+        }
+    )
+    
+    return {
+        "id": role.id,
+        "name": role.name,
+        "message": "Role created successfully"
+    }
+
+
+@router.get("/roles/{role_id}")
+@require_permission(Resource.ROLES, Action.READ)
+async def get_role(
+    role_id: int,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Get role details"""
+    role = db.query(Role).filter(
+        and_(
+            Role.id == role_id,
+            Role.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not role:
+        raise HTTPException(404, "Role not found")
+    
+    # Get permissions
+    permissions = db.query(Permission).filter(
+        Permission.role_id == role.id
+    ).all()
+    
+    # Get users with this role
+    users = db.query(User).join(
+        user_roles
+    ).filter(
+        and_(
+            user_roles.c.role_id == role.id,
+            User.tenant_id == tenant_id
+        )
+    ).all()
+    
+    return {
+        "id": role.id,
+        "name": role.name,
+        "description": role.description,
+        "is_system_role": role.is_system_role,
+        "created_at": role.created_at,
+        "permissions": [p.name for p in permissions],
+        "users": [
+            {"id": u.id, "email": u.email, "username": u.username}
+            for u in users
+        ]
+    }
+
+
+@router.put("/roles/{role_id}")
+@require_permission(Resource.ROLES, Action.UPDATE)
+async def update_role(
+    role_id: int,
+    update_data: RoleUpdate,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Update a role"""
+    role = db.query(Role).filter(
+        and_(
+            Role.id == role_id,
+            Role.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not role:
+        raise HTTPException(404, "Role not found")
+    
+    if role.is_system_role:
+        raise HTTPException(400, "Cannot modify system roles")
+    
+    # Update basic fields
+    if update_data.name is not None:
+        # Check name uniqueness
+        existing = db.query(Role).filter(
+            and_(
+                Role.name == update_data.name,
+                Role.tenant_id == tenant_id,
+                Role.id != role_id
+            )
+        ).first()
+        
+        if existing:
+            raise HTTPException(400, "Role with this name already exists")
+        
+        role.name = update_data.name
+    
+    if update_data.description is not None:
+        role.description = update_data.description
+    
+    # SECURITY FIX: Use comprehensive RBAC validation for role updates
+    if update_data.permissions is not None or getattr(update_data, 'inherits_from', None) is not None:
+        validator = RBACValidator(db)
+        
+        # Build update data for validation
+        validation_data = {
+            "id": str(role_id),
+            "name": update_data.name or role.name,
+            "permissions": update_data.permissions if update_data.permissions is not None else [p.name for p in role.permissions],
+            "inherits_from": getattr(update_data, 'inherits_from', role.inherits_from or [])
+        }
+        
+        # Validate role update with comprehensive checks
+        validator.validate_role_update(str(role_id), validation_data, current_user)
+    
+    # Update permissions if provided
+    if update_data.permissions is not None:
+        # Remove existing permissions
+        db.query(Permission).filter(
+            Permission.role_id == role.id
+        ).delete()
+        
+        # Add new permissions
+        for perm_string in update_data.permissions:
+            try:
+                resource, action = permission_service.parse_permission(perm_string)
+                permission = Permission(
+                    name=perm_string,
+                    resource=resource,
+                    action=action,
+                    role_id=role.id,
+                    tenant_id=tenant_id
+                )
+                db.add(permission)
+            except ValueError:
+                raise HTTPException(400, f"Invalid permission format: {perm_string}")
+    
+    # Update role inheritance if provided
+    if hasattr(update_data, 'inherits_from') and update_data.inherits_from is not None:
+        role.inherits_from = update_data.inherits_from
+    
+    db.commit()
+    
+    # Clear permission cache
+    permission_service.clear_cache()
+    
+    return {"message": "Role updated successfully"}
+
+
+@router.delete("/roles/{role_id}")
+@require_permission(Resource.ROLES, Action.DELETE)
+async def delete_role(
+    role_id: int,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Delete a role"""
+    role = db.query(Role).filter(
+        and_(
+            Role.id == role_id,
+            Role.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not role:
+        raise HTTPException(404, "Role not found")
+    
+    if role.is_system_role:
+        raise HTTPException(400, "Cannot delete system roles")
+    
+    # Check if users have this role
+    user_count = db.query(user_roles).filter(
+        user_roles.c.role_id == role_id
+    ).count()
+    
+    if user_count > 0:
+        raise HTTPException(400, f"Cannot delete role: {user_count} users have this role")
+    
+    db.delete(role)
+    db.commit()
+    
+    # Clear permission cache
+    permission_service.clear_cache()
+    
+    return {"message": "Role deleted successfully"}
+
+
+# User role assignment
+@router.get("/users/{user_id}/roles")
+@require_permission(Resource.USERS, Action.READ)
+async def get_user_roles(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Get roles assigned to a user"""
+    # Verify user exists in tenant
+    user = db.query(User).filter(
+        and_(
+            User.id == user_id,
+            User.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not user:
+        raise HTTPException(404, "User not found")
+    
+    roles = db.query(Role).join(
+        user_roles
+    ).filter(
+        and_(
+            user_roles.c.user_id == user_id,
+            Role.tenant_id == tenant_id
+        )
+    ).all()
+    
+    return {
+        "user_id": user_id,
+        "roles": [
+            {
+                "id": r.id,
+                "name": r.name,
+                "description": r.description
+            }
+            for r in roles
+        ]
+    }
+
+
+@router.put("/users/{user_id}/roles")
+@require_permission(Resource.USERS, Action.UPDATE)
+async def assign_user_roles(
+    user_id: int,
+    assignment: UserRoleAssignment,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Assign roles to a user"""
+    # Verify user exists in tenant
+    user = db.query(User).filter(
+        and_(
+            User.id == user_id,
+            User.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not user:
+        raise HTTPException(404, "User not found")
+    
+    # Verify all roles exist
+    roles = db.query(Role).filter(
+        and_(
+            Role.id.in_(assignment.role_ids),
+            Role.tenant_id == tenant_id
+        )
+    ).all()
+    
+    if len(roles) != len(assignment.role_ids):
+        raise HTTPException(400, "One or more roles not found")
+    
+    # SECURITY FIX: Use comprehensive RBAC validation for role assignments
+    validator = RBACValidator(db)
+    
+    # Validate role assignment with comprehensive checks
+    validator.validate_role_assignment(
+        user_id=str(user_id),
+        role_ids=[str(r.id) for r in roles],
+        requesting_user=current_user
+    )
+    
+    # HIGH FIX: Prevent self-privilege escalation
+    if user_id == current_user.id:
+        # Users can only remove their own roles, not add new ones
+        current_role_ids = {role.id for role in user.roles}
+        new_role_ids = set(assignment.role_ids)
+        
+        if new_role_ids - current_role_ids:  # Adding new roles to self
+            raise HTTPException(
+                403,
+                "Cannot assign additional roles to yourself - contact an administrator"
+            )
+    
+    # Remove existing role assignments
+    db.query(user_roles).filter(
+        user_roles.c.user_id == user_id
+    ).delete()
+    
+    # Add new role assignments
+    for role_id in assignment.role_ids:
+        db.execute(
+            user_roles.insert().values(
+                user_id=user_id,
+                role_id=role_id,
+                granted_by=current_user.id,
+                tenant_id=tenant_id
+            )
+        )
+    
+    db.commit()
+    
+    # Clear permission cache for user
+    permission_service.clear_cache(user_id)
+    
+    return {"message": "Roles assigned successfully"}
+
+
+# Permission queries
+@router.get("/permissions")
+async def list_available_permissions(
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant)
+):
+    """List all available permissions"""
+    permissions = []
+    
+    for resource in Resource:
+        for action in Action:
+            perm = permission_service.format_permission(resource.value, action.value)
+            permissions.append({
+                "permission": perm,
+                "resource": resource.value,
+                "action": action.value
+            })
+    
+    # Add wildcards
+    permissions.append({
+        "permission": "*:*",
+        "resource": "*",
+        "action": "*",
+        "description": "All permissions"
+    })
+    
+    for resource in Resource:
+        perm = f"{resource.value}:*"
+        permissions.append({
+            "permission": perm,
+            "resource": resource.value,
+            "action": "*",
+            "description": f"All actions on {resource.value}"
+        })
+    
+    return {"permissions": permissions}
+
+
+@router.get("/my-permissions")
+async def get_my_permissions(
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Get current user's permissions"""
+    permissions = permission_service.get_user_permissions(
+        db, current_user, tenant_id
+    )
+    
+    return {
+        "user_id": current_user.id,
+        "permissions": list(permissions)
+    }
+
+
+@router.post("/check-permission")
+async def check_permission(
+    resource: str,
+    action: str,
+    user_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Check if a user has a specific permission"""
+    # If no user_id provided, check current user
+    if user_id is None:
+        user_id = current_user.id
+    else:
+        # Only admins can check other users' permissions
+        if not current_user.is_superuser and user_id != current_user.id:
+            if not permission_service.user_has_permission(
+                db, current_user, Resource.USERS.value, Action.READ.value, tenant_id
+            ):
+                raise HTTPException(403, "Permission denied")
+    
+    # Get user
+    user = db.query(User).filter(
+        and_(
+            User.id == user_id,
+            User.tenant_id == tenant_id
+        )
+    ).first()
+    
+    if not user:
+        raise HTTPException(404, "User not found")
+    
+    has_permission = permission_service.user_has_permission(
+        db, user, resource, action, tenant_id
+    )
+    
+    return {
+        "user_id": user_id,
+        "resource": resource,
+        "action": action,
+        "has_permission": has_permission
+    }
+
+
+# Role templates
+@router.get("/role-templates")
+async def get_role_templates(
+    current_user: User = Depends(get_current_user)
+):
+    """Get available role templates"""
+    return {
+        "templates": [
+            {
+                "key": key,
+                "name": data["name"],
+                "description": data["description"],
+                "permissions": data["permissions"]
+            }
+            for key, data in ROLE_TEMPLATES.items()
+        ]
+    }
+
+
+@router.post("/initialize-roles")
+async def initialize_default_roles(
+    current_user: User = Depends(get_current_superuser),
+    tenant_id: str = Depends(require_tenant),
+    db: Session = Depends(get_db)
+):
+    """Initialize default roles for the tenant (super admin only)"""
+    await create_default_roles(db, tenant_id)
+    
+    return {"message": "Default roles created successfully"}

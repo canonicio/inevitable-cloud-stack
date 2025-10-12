@@ -1,0 +1,382 @@
+{% extends "admin/base.html" %}
+
+{% block content %}
+<div class="p-6" x-data="dashboardApp()">
+    <!-- Dashboard Header -->
+    <div class="mb-8">
+        <div class="sm:flex sm:items-center sm:justify-between">
+            <div>
+                <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
+                <p class="mt-1 text-sm text-gray-600">Welcome back! Here's what's happening with your platform.</p>
+            </div>
+            <div class="mt-4 sm:mt-0 sm:ml-16 sm:flex-none">
+                <button type="button" 
+                        @click="refreshDashboard"
+                        class="inline-flex items-center justify-center rounded-lg border border-transparent bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+                    <i class="fas fa-sync-alt mr-2" :class="refreshing ? 'animate-spin' : ''"></i>
+                    Refresh
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Quick Stats -->
+    <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4 mb-8">
+        <div class="bg-white overflow-hidden shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="p-5">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <div class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
+                            <i class="fas fa-users text-white text-sm"></i>
+                        </div>
+                    </div>
+                    <div class="ml-5 w-0 flex-1">
+                        <dl>
+                            <dt class="text-sm font-medium text-gray-500 truncate">Total Users</dt>
+                            <dd class="text-2xl font-semibold text-gray-900" x-text="stats.totalUsers">-</dd>
+                        </dl>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <div class="flex items-center text-sm">
+                        <span class="text-green-600 font-medium">+12%</span>
+                        <span class="text-gray-500 ml-1">from last month</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-white overflow-hidden shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="p-5">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <div class="w-8 h-8 bg-green-500 rounded-lg flex items-center justify-center">
+                            <i class="fas fa-chart-line text-white text-sm"></i>
+                        </div>
+                    </div>
+                    <div class="ml-5 w-0 flex-1">
+                        <dl>
+                            <dt class="text-sm font-medium text-gray-500 truncate">Active Sessions</dt>
+                            <dd class="text-2xl font-semibold text-gray-900" x-text="stats.activeSessions">-</dd>
+                        </dl>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <div class="flex items-center text-sm">
+                        <span class="text-green-600 font-medium">+5%</span>
+                        <span class="text-gray-500 ml-1">from yesterday</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-white overflow-hidden shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="p-5">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <div class="w-8 h-8 bg-yellow-500 rounded-lg flex items-center justify-center">
+                            <i class="fas fa-exclamation-triangle text-white text-sm"></i>
+                        </div>
+                    </div>
+                    <div class="ml-5 w-0 flex-1">
+                        <dl>
+                            <dt class="text-sm font-medium text-gray-500 truncate">Security Alerts</dt>
+                            <dd class="text-2xl font-semibold text-gray-900" x-text="stats.securityAlerts">-</dd>
+                        </dl>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <div class="flex items-center text-sm">
+                        <span class="text-red-600 font-medium">2 new</span>
+                        <span class="text-gray-500 ml-1">in last 24h</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="bg-white overflow-hidden shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="p-5">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <div class="w-8 h-8 bg-purple-500 rounded-lg flex items-center justify-center">
+                            <i class="fas fa-server text-white text-sm"></i>
+                        </div>
+                    </div>
+                    <div class="ml-5 w-0 flex-1">
+                        <dl>
+                            <dt class="text-sm font-medium text-gray-500 truncate">System Health</dt>
+                            <dd class="text-2xl font-semibold text-gray-900">99.9%</dd>
+                        </dl>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <div class="flex items-center text-sm">
+                        <span class="text-green-600 font-medium">Excellent</span>
+                        <span class="text-gray-500 ml-1">all systems operational</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Stacked Cards Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+        
+        <!-- Recent Activity Card -->
+        <div class="bg-white shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-lg font-medium text-gray-900">Recent Activity</h3>
+                    <button class="text-sm text-indigo-600 hover:text-indigo-500">View all</button>
+                </div>
+            </div>
+            <div class="px-6 py-4">
+                <div class="space-y-4" x-show="recentActivity.length > 0">
+                    <template x-for="activity in recentActivity" :key="activity.id">
+                        <div class="flex items-start space-x-3">
+                            <div class="flex-shrink-0">
+                                <div class="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center">
+                                    <i :class="activity.icon" class="text-sm text-gray-600"></i>
+                                </div>
+                            </div>
+                            <div class="min-w-0 flex-1">
+                                <p class="text-sm text-gray-900" x-text="activity.description"></p>
+                                <p class="text-xs text-gray-500" x-text="activity.timestamp"></p>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+                <div x-show="recentActivity.length === 0" class="text-center py-8">
+                    <i class="fas fa-clock text-gray-300 text-2xl mb-2"></i>
+                    <p class="text-sm text-gray-500">No recent activity</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- System Status Card -->
+        <div class="bg-white shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-lg font-medium text-gray-900">System Status</h3>
+                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                        <i class="fas fa-circle text-green-500 mr-1 text-xs"></i>
+                        Operational
+                    </span>
+                </div>
+            </div>
+            <div class="px-6 py-4">
+                <div class="space-y-4">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <i class="fas fa-database text-blue-500 mr-3"></i>
+                            <span class="text-sm text-gray-900">Database</span>
+                        </div>
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Healthy
+                        </span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <i class="fas fa-cloud text-indigo-500 mr-3"></i>
+                            <span class="text-sm text-gray-900">API Services</span>
+                        </div>
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Online
+                        </span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <i class="fas fa-shield-alt text-green-500 mr-3"></i>
+                            <span class="text-sm text-gray-900">Security</span>
+                        </div>
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Protected
+                        </span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <i class="fas fa-backup text-purple-500 mr-3"></i>
+                            <span class="text-sm text-gray-900">Backups</span>
+                        </div>
+                        <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                            Current
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Quick Actions Card -->
+        <div class="bg-white shadow-sm rounded-lg border border-gray-200 card-hover">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-medium text-gray-900">Quick Actions</h3>
+            </div>
+            <div class="px-6 py-4">
+                <div class="grid grid-cols-2 gap-3">
+                    <button class="flex flex-col items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        <i class="fas fa-user-plus text-blue-500 text-xl mb-2"></i>
+                        <span class="text-sm text-gray-900">Add User</span>
+                    </button>
+                    <button class="flex flex-col items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        <i class="fas fa-cog text-gray-500 text-xl mb-2"></i>
+                        <span class="text-sm text-gray-900">Settings</span>
+                    </button>
+                    <button class="flex flex-col items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        <i class="fas fa-download text-green-500 text-xl mb-2"></i>
+                        <span class="text-sm text-gray-900">Backup</span>
+                    </button>
+                    <button class="flex flex-col items-center p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
+                        <i class="fas fa-chart-bar text-purple-500 text-xl mb-2"></i>
+                        <span class="text-sm text-gray-900">Reports</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Dynamic Model Cards -->
+        <template x-for="card in modelCards" :key="card.id">
+            <div class="bg-white shadow-sm rounded-lg border border-gray-200 card-hover">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <i :class="'fas fa-' + card.icon + ' text-gray-500 mr-3'"></i>
+                            <h3 class="text-lg font-medium text-gray-900" x-text="card.title"></h3>
+                        </div>
+                        <span class="text-sm text-gray-500" x-text="card.count + ' items'"></span>
+                    </div>
+                </div>
+                <div class="px-6 py-4">
+                    <p class="text-sm text-gray-600 mb-4" x-text="card.subtitle"></p>
+                    <div class="flex space-x-2">
+                        <template x-for="action in card.actions" :key="action.label">
+                            <a :href="action.url" 
+                               class="inline-flex items-center px-3 py-1.5 border border-gray-300 text-xs font-medium rounded text-gray-700 bg-white hover:bg-gray-50">
+                                <span x-text="action.label"></span>
+                            </a>
+                        </template>
+                    </div>
+                </div>
+            </div>
+        </template>
+        
+    </div>
+</div>
+
+<script>
+function dashboardApp() {
+    return {
+        refreshing: false,
+        stats: {
+            totalUsers: 0,
+            activeSessions: 0,
+            securityAlerts: 0
+        },
+        recentActivity: [],
+        modelCards: [],
+        
+        async init() {
+            await this.loadStats();
+            await this.loadRecentActivity();
+            await this.loadModelCards();
+        },
+        
+        async refreshDashboard() {
+            this.refreshing = true;
+            try {
+                await Promise.all([
+                    this.loadStats(),
+                    this.loadRecentActivity(),
+                    this.loadModelCards()
+                ]);
+            } finally {
+                this.refreshing = false;
+            }
+        },
+        
+        async loadStats() {
+            try {
+                const response = await fetch('/api/admin/stats');
+                if (response.ok) {
+                    this.stats = await response.json();
+                }
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+            }
+        },
+        
+        async loadRecentActivity() {
+            try {
+                const response = await fetch('/api/admin/audit-logs?limit=5');
+                if (response.ok) {
+                    const logs = await response.json();
+                    this.recentActivity = logs.map(log => ({
+                        id: log.id,
+                        description: `${log.action} on ${log.resource_type}`,
+                        timestamp: new Date(log.created_at).toLocaleString(),
+                        icon: this.getActivityIcon(log.action)
+                    }));
+                }
+            } catch (error) {
+                console.error('Failed to load recent activity:', error);
+            }
+        },
+        
+        async loadModelCards() {
+            try {
+                const response = await fetch('/api/admin/metadata');
+                if (response.ok) {
+                    const metadata = await response.json();
+                    this.modelCards = [];
+                    
+                    for (const navGroup of metadata.navigation) {
+                        for (const model of navGroup.models) {
+                            this.modelCards.push({
+                                id: model.key,
+                                title: model.name,
+                                subtitle: model.description,
+                                icon: 'table',
+                                count: await this.getModelCount(model.table_name),
+                                actions: model.can_create ? [
+                                    { label: 'View All', url: `/admin/models/${model.key}` },
+                                    { label: 'Create New', url: `/admin/models/${model.key}/create` }
+                                ] : [
+                                    { label: 'View All', url: `/admin/models/${model.key}` }
+                                ]
+                            });
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load model cards:', error);
+            }
+        },
+        
+        async getModelCount(tableName) {
+            try {
+                const response = await fetch(`/api/admin/models/${tableName}/count`);
+                if (response.ok) {
+                    const data = await response.json();
+                    return data.count;
+                }
+            } catch (error) {
+                console.error(`Failed to get count for ${tableName}:`, error);
+            }
+            return 0;
+        },
+        
+        getActivityIcon(action) {
+            const iconMap = {
+                'user_created': 'fas fa-user-plus',
+                'user_updated': 'fas fa-user-edit',
+                'user_deleted': 'fas fa-user-minus',
+                'login': 'fas fa-sign-in-alt',
+                'logout': 'fas fa-sign-out-alt',
+                'mfa_enabled': 'fas fa-shield-alt',
+                'default': 'fas fa-circle'
+            };
+            return iconMap[action] || iconMap['default'];
+        }
+    }
+}
+</script>
+{% endblock %}

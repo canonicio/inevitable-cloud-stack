@@ -1,0 +1,425 @@
+"""
+MCP Authentication Routes
+"""
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
+import uuid
+
+from modules.core.database import get_db
+from modules.auth.dependencies import get_current_user, require_mfa
+from modules.auth.rbac import require_permissions
+from modules.auth.models import User
+from modules.auth.rbac import Permission, SystemRole
+
+from .models import (
+    MCPPolicy, MCPSession, MCPAuditLog,
+    MCPPermissionType, MCPResourceType, MCPAccessLevel
+)
+from .auth import MCPAuthProvider
+from .policy_engine import PolicyEngine
+
+
+router = APIRouter(prefix="/mcp/auth", tags=["mcp-auth"])
+
+
+# Pydantic models
+class MCPSessionCreate(BaseModel):
+    policy_id: int
+    client_id: str
+    client_version: Optional[str] = None
+
+
+class MCPSessionResponse(BaseModel):
+    session_id: str
+    session_token: str
+    refresh_token: str
+    expires_at: str
+    access_level: MCPAccessLevel
+    permissions: List[str]
+
+
+class MCPRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class MCPPolicyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+    resource_type: MCPResourceType
+    resource_pattern: str = Field(..., min_length=1, max_length=255)
+    permissions: List[MCPPermissionType]
+    conditions: Optional[Dict[str, Any]] = None
+    access_level: MCPAccessLevel = MCPAccessLevel.STANDARD
+    require_mfa: bool = True
+    require_approval: bool = False
+
+
+class MCPPolicyResponse(BaseModel):
+    id: int
+    tenant_id: str
+    name: str
+    description: Optional[str]
+    resource_type: MCPResourceType
+    resource_pattern: str
+    permissions: List[str]
+    conditions: Optional[Dict[str, Any]]
+    access_level: MCPAccessLevel
+    require_mfa: bool
+    require_approval: bool
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class MCPAccessCheck(BaseModel):
+    session_token: str
+    resource_type: MCPResourceType
+    resource_name: str
+    permission: MCPPermissionType
+    context: Optional[Dict[str, Any]] = None
+
+
+class MCPAccessResponse(BaseModel):
+    allowed: bool
+    denial_reason: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[int] = None
+
+
+class MCPAuditLogResponse(BaseModel):
+    id: int
+    tenant_id: str
+    session_id: str
+    user_id: int
+    action: str
+    resource_type: MCPResourceType
+    resource_name: str
+    response_status: str
+    timestamp: datetime
+    duration_ms: Optional[int]
+    
+    class Config:
+        from_attributes = True
+
+
+# Routes
+@router.post("/sessions", response_model=MCPSessionResponse)
+@require_mfa
+async def create_mcp_session(
+    request: Request,
+    session_data: MCPSessionCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new MCP authentication session"""
+    
+    auth_provider = MCPAuthProvider(db)
+    
+    # Get tenant ID from JWT
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found in user context"
+        )
+    
+    # Get client IP
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("User-Agent")
+    
+    try:
+        session = auth_provider.create_session(
+            user=current_user,
+            tenant_id=tenant_id,
+            policy_id=session_data.policy_id,
+            client_id=session_data.client_id,
+            client_version=session_data.client_version,
+            ip_address=client_ip,
+            user_agent=user_agent,
+            mfa_verified=True  # Already verified by @require_mfa
+        )
+        
+        return MCPSessionResponse(**session)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        from modules.core.secure_error_messages import create_api_error
+        raise create_api_error(e, request)
+
+
+@router.post("/refresh", response_model=MCPSessionResponse)
+async def refresh_mcp_session(
+    refresh_data: MCPRefreshRequest,
+    db: Session = Depends(get_db)
+):
+    """Refresh an MCP session"""
+    
+    auth_provider = MCPAuthProvider(db)
+    
+    try:
+        refreshed_session = auth_provider.refresh_session(
+            refresh_token=refresh_data.refresh_token
+        )
+        
+        return MCPSessionResponse(**refreshed_session)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        from modules.core.secure_error_messages import create_api_error
+        raise create_api_error(e)
+
+
+@router.post("/check-access", response_model=MCPAccessResponse)
+async def check_mcp_access(
+    access_check: MCPAccessCheck,
+    db: Session = Depends(get_db)
+):
+    """Check if a session has access to a resource"""
+    
+    auth_provider = MCPAuthProvider(db)
+    policy_engine = PolicyEngine(db)
+    
+    # Validate session
+    session = auth_provider.validate_session(access_check.session_token)
+    if not session:
+        return MCPAccessResponse(
+            allowed=False,
+            denial_reason="Invalid or expired session"
+        )
+    
+    # Check access
+    allowed, denial_reason = policy_engine.check_access(
+        session=session,
+        resource_type=access_check.resource_type,
+        resource_name=access_check.resource_name,
+        permission=access_check.permission,
+        context=access_check.context
+    )
+    
+    # Log the access check
+    auth_provider._log_audit(
+        session=session,
+        action=f"{access_check.resource_type.value}.{access_check.permission.value}",
+        resource_type=access_check.resource_type.value,
+        resource_name=access_check.resource_name,
+        response_status="allowed" if allowed else "denied",
+        request_data=access_check.context,
+        error_message=denial_reason
+    )
+    
+    return MCPAccessResponse(
+        allowed=allowed,
+        denial_reason=denial_reason,
+        session_id=str(session.id),
+        user_id=session.user_id
+    )
+
+
+@router.delete("/sessions/{session_id}")
+async def revoke_mcp_session(
+    session_id: str,
+    reason: str,
+    current_user: User = Depends(require_permissions([Permission.ADMIN_PANEL])),
+    db: Session = Depends(get_db)
+):
+    """Revoke an MCP session"""
+    
+    auth_provider = MCPAuthProvider(db)
+    
+    try:
+        auth_provider.revoke_session(
+            session_id=session_id,
+            reason=reason,
+            revoked_by=current_user
+        )
+        
+        return {"message": "Session revoked successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to revoke session: Operation failed. Please try again later."
+        )
+
+
+@router.get("/sessions", response_model=List[Dict[str, Any]])
+async def list_mcp_sessions(
+    user_id: Optional[int] = None,
+    active_only: bool = True,
+    current_user: User = Depends(require_permissions([Permission.ADMIN_PANEL])),
+    db: Session = Depends(get_db)
+):
+    """List MCP sessions"""
+    
+    # Get tenant ID
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found"
+        )
+    
+    auth_provider = MCPAuthProvider(db)
+    sessions = auth_provider.get_active_sessions(
+        tenant_id=tenant_id,
+        user_id=user_id
+    )
+    
+    return [
+        {
+            "id": str(session.id),
+            "user_id": session.user_id,
+            "policy_id": session.policy_id,
+            "client_id": session.client_id,
+            "created_at": session.created_at,
+            "expires_at": session.expires_at,
+            "last_activity": session.last_activity,
+            "mfa_verified": session.mfa_verified
+        }
+        for session in sessions
+    ]
+
+
+@router.post("/policies", response_model=MCPPolicyResponse)
+async def create_mcp_policy(
+    policy_data: MCPPolicyCreate,
+    current_user: User = Depends(require_permissions([Permission.ADMIN_PANEL])),
+    db: Session = Depends(get_db)
+):
+    """Create a new MCP policy"""
+    
+    # Get tenant ID
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found"
+        )
+    
+    policy_engine = PolicyEngine(db)
+    
+    try:
+        policy = policy_engine.create_policy(
+            tenant_id=tenant_id,
+            name=policy_data.name,
+            resource_type=policy_data.resource_type,
+            resource_pattern=policy_data.resource_pattern,
+            permissions=policy_data.permissions,
+            created_by=current_user,
+            description=policy_data.description,
+            conditions=policy_data.conditions,
+            access_level=policy_data.access_level,
+            require_mfa=policy_data.require_mfa,
+            require_approval=policy_data.require_approval
+        )
+        
+        return MCPPolicyResponse.from_orm(policy)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create policy: Operation failed. Please try again later."
+        )
+
+
+@router.get("/policies", response_model=List[MCPPolicyResponse])
+async def list_mcp_policies(
+    active_only: bool = True,
+    current_user: User = Depends(require_permissions([Permission.ADMIN_PANEL])),
+    db: Session = Depends(get_db)
+):
+    """List MCP policies"""
+    
+    # Get tenant ID
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found"
+        )
+    
+    query = db.query(MCPPolicy).filter(MCPPolicy.tenant_id == tenant_id)
+    
+    if active_only:
+        query = query.filter(MCPPolicy.is_active == True)
+    
+    policies = query.all()
+    
+    return [MCPPolicyResponse.from_orm(policy) for policy in policies]
+
+
+@router.get("/audit-logs", response_model=List[MCPAuditLogResponse])
+async def list_mcp_audit_logs(
+    session_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    resource_type: Optional[MCPResourceType] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    limit: int = 100,
+    current_user: User = Depends(require_permissions([Permission.ADMIN_PANEL])),
+    db: Session = Depends(get_db)
+):
+    """List MCP audit logs"""
+    
+    # Get tenant ID
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found"
+        )
+    
+    query = db.query(MCPAuditLog).filter(MCPAuditLog.tenant_id == tenant_id)
+    
+    if session_id:
+        query = query.filter(MCPAuditLog.session_id == session_id)
+    
+    if user_id:
+        query = query.filter(MCPAuditLog.user_id == user_id)
+    
+    if resource_type:
+        query = query.filter(MCPAuditLog.resource_type == resource_type)
+    
+    if start_date:
+        query = query.filter(MCPAuditLog.timestamp >= start_date)
+    
+    if end_date:
+        query = query.filter(MCPAuditLog.timestamp <= end_date)
+    
+    logs = query.order_by(MCPAuditLog.timestamp.desc()).limit(limit).all()
+    
+    return [MCPAuditLogResponse.from_orm(log) for log in logs]
+
+
+@router.get("/permissions")
+async def get_effective_permissions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get effective MCP permissions for the current user"""
+    
+    # Get tenant ID
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID not found"
+        )
+    
+    policy_engine = PolicyEngine(db)
+    permissions = policy_engine.get_effective_permissions(
+        user=current_user,
+        tenant_id=tenant_id
+    )
+    
+    return {"permissions": permissions}

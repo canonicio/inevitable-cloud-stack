@@ -1,0 +1,253 @@
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from pydantic import BaseModel
+from modules.core.database import get_db
+from modules.auth.models import User, AuditLog
+from modules.admin.mfa import setup_mfa, enable_mfa, disable_mfa, verify_mfa
+from modules.admin.audit_logs import SecureAuditService as AuditService
+from modules.auth.dependencies import get_current_user
+from modules.auth.rbac import require_admin, require_permissions, Permission, SystemRole
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# Pydantic models for request/response
+class MFASetupResponse(BaseModel):
+    secret: str
+    qr_code: str
+    message: str
+
+
+class MFATokenRequest(BaseModel):
+    token: str
+
+
+class MFAResponse(BaseModel):
+    message: str
+    backup_codes: Optional[List[str]] = None
+
+
+class AuditLogResponse(BaseModel):
+    id: int
+    user_id: Optional[int]
+    action: str
+    resource_type: Optional[str]
+    resource_id: Optional[str]
+    ip_address: Optional[str]
+    user_agent: Optional[str]
+    details: Optional[str]
+    created_at: str
+    tenant_id: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+# MFA Routes
+@router.post("/mfa/setup", response_model=MFASetupResponse)
+async def setup_user_mfa(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Initialize MFA setup for the current user"""
+    result = await setup_mfa(current_user.id, db)
+    return result
+
+
+@router.post("/mfa/enable", response_model=MFAResponse)
+async def enable_user_mfa(
+    token_request: MFATokenRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Enable MFA for the current user"""
+    result = await enable_mfa(current_user.id, token_request.token, db)
+    
+    # Log the MFA enable action
+    await AuditService.log_action(
+        action="mfa_enabled",
+        user_id=current_user.id,
+        resource_type="user",
+        resource_id=str(current_user.id),
+        request=request,
+        db=db
+    )
+    
+    return result
+
+
+@router.post("/mfa/disable", response_model=MFAResponse)
+async def disable_user_mfa(
+    token_request: MFATokenRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Disable MFA for the current user"""
+    result = await disable_mfa(current_user.id, token_request.token, db)
+    
+    # Log the MFA disable action
+    await AuditService.log_action(
+        action="mfa_disabled",
+        user_id=current_user.id,
+        resource_type="user",
+        resource_id=str(current_user.id),
+        request=request,
+        db=db
+    )
+    
+    return result
+
+
+# Audit Log Routes
+@router.get("/audit-logs", response_model=List[AuditLogResponse])
+async def get_audit_logs(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    action_filter: Optional[str] = None,
+    resource_type_filter: Optional[str] = None,
+    current_user: User = Depends(require_permissions([Permission.AUDIT_READ.value])),
+    db: Session = Depends(get_db)
+):
+    """Get audit logs (admin only)"""
+    logs = await AuditService.get_all_audit_logs(
+        limit=limit,
+        offset=offset,
+        action_filter=action_filter,
+        resource_type_filter=resource_type_filter,
+        db=db
+    )
+    
+    # Log the audit log access
+    await AuditService.log_action(
+        action="audit_logs_accessed",
+        user_id=current_user.id,
+        resource_type="audit_logs",
+        details={"limit": limit, "offset": offset},
+        request=request,
+        db=db
+    )
+    
+    return logs
+
+
+@router.get("/audit-logs/user/{user_id}", response_model=List[AuditLogResponse])
+async def get_user_audit_logs(
+    user_id: int,
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get audit logs for a specific user"""
+    # Allow users to see their own logs or admins to see any user's logs
+    if current_user.id != user_id:
+        # Check if user has admin permissions
+        from modules.auth.rbac import RBACService
+        rbac = RBACService(db)
+        if not rbac.user_has_permission(current_user, Permission.AUDIT_READ.value):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient permissions to view other users' audit logs"
+            )
+    
+    logs = await AuditService.get_user_audit_logs(
+        user_id=user_id,
+        limit=limit,
+        offset=offset,
+        db=db
+    )
+    
+    # Log the audit log access
+    await AuditService.log_action(
+        action="user_audit_logs_accessed",
+        user_id=current_user.id,
+        resource_type="audit_logs",
+        resource_id=str(user_id),
+        details={"limit": limit, "offset": offset},
+        request=request,
+        db=db
+    )
+    
+    return logs
+
+
+@router.get("/users", response_model=List[dict])
+async def get_users(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(require_permissions([Permission.USERS_READ.value])),
+    db: Session = Depends(get_db)
+):
+    """Get all users (admin only)"""
+    
+    users = db.query(User).limit(limit).offset(offset).all()
+    
+    # Log the user list access
+    await AuditService.log_action(
+        action="users_list_accessed",
+        user_id=current_user.id,
+        resource_type="users",
+        details={"limit": limit, "offset": offset},
+        request=request,
+        db=db
+    )
+    
+    # Return user data without sensitive fields
+    return [
+        {
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "is_active": user.is_active,
+            "is_verified": user.is_verified,
+            "mfa_enabled": user.mfa_enabled,
+            "created_at": user.created_at.isoformat(),
+            "updated_at": user.updated_at.isoformat(),
+            "tenant_id": user.tenant_id
+        }
+        for user in users
+    ]
+
+
+@router.put("/users/{user_id}/status")
+async def update_user_status(
+    user_id: int,
+    is_active: bool,
+    request: Request,
+    current_user: User = Depends(require_permissions([Permission.USERS_STATUS.value])),
+    db: Session = Depends(get_db)
+):
+    """Update user active status (admin only)"""
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    old_status = user.is_active
+    user.is_active = is_active
+    db.commit()
+    
+    # Log the user status change
+    await AuditService.log_action(
+        action="user_status_changed",
+        user_id=current_user.id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details={
+            "old_status": old_status,
+            "new_status": is_active,
+            "target_user_email": user.email
+        },
+        request=request,
+        db=db
+    )
+    
+    return {"message": f"User {'activated' if is_active else 'deactivated'} successfully"}

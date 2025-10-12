@@ -1,0 +1,717 @@
+"""
+Admin API Routes for Subscription Management
+
+Provides admin endpoints for managing subscriptions, bulk migrations, and pricing plans.
+"""
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+from pydantic import BaseModel, Field
+
+from ..core.database import get_db
+from ..auth.dependencies import get_current_user, require_admin
+from ..auth.models import User
+from ..auth.permissions import require_permission, Permission
+from .subscription_management import (
+    PricingPlanStatus, MigrationStrategy, MigrationStatus,
+    PricingPlan, SubscriptionMigration, BulkMigrationJob,
+    SubscriptionAuditLog, PlanTransitionRule
+)
+from .subscription_service import subscription_management_service
+from .models import Customer, Package
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/admin/billing", tags=["admin-billing"])
+
+
+# ==================== Request/Response Models ====================
+
+class PricingPlanUpdate(BaseModel):
+    status: PricingPlanStatus
+    replacement_plan_id: Optional[int] = None
+    migration_strategy: Optional[MigrationStrategy] = None
+    sunset_date: Optional[datetime] = None
+
+
+class MigrationCreate(BaseModel):
+    subscription_id: str
+    target_plan_id: int
+    strategy: MigrationStrategy = MigrationStrategy.END_OF_BILLING_PERIOD
+    scheduled_for: Optional[datetime] = None
+    reason: Optional[str] = None
+    preserve_billing_date: bool = True
+    notify_customer: bool = True
+
+
+class BulkMigrationCreate(BaseModel):
+    name: str
+    source_plan_ids: List[int]
+    target_plan_id: int
+    strategy: MigrationStrategy = MigrationStrategy.END_OF_BILLING_PERIOD
+    criteria: Optional[Dict[str, Any]] = None
+    scheduled_for: Optional[datetime] = None
+    dry_run: bool = False
+    notify_customers: bool = True
+    require_approval: bool = True
+
+
+class TransitionRuleCreate(BaseModel):
+    name: str
+    source_plan_id: int
+    target_plan_id: int
+    strategy: MigrationStrategy
+    conditions: Optional[Dict[str, Any]] = None
+    effective_date: Optional[datetime] = None
+    expiration_date: Optional[datetime] = None
+    auto_approve: bool = False
+    notify_customer: bool = True
+    priority: int = 0
+
+
+class SubscriptionUpdate(BaseModel):
+    plan_id: Optional[int] = None
+    cancel_at_period_end: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class GrandfatherRequest(BaseModel):
+    plan_id: int
+    criteria: Optional[Dict[str, Any]] = None
+
+
+# ==================== Pricing Plan Management ====================
+
+@router.post("/sync-pricing-plans")
+@require_permission(Permission.BILLING_ADMIN)
+async def sync_pricing_plans(
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Sync pricing plans from Stripe"""
+    try:
+        result = subscription_management_service.sync_pricing_plans(db)
+        return {
+            "success": True,
+            "message": f"Synced {result['synced']} of {result['total']} pricing plans",
+            "details": result
+        }
+    except Exception as e:
+        logger.error(f"Error syncing pricing plans: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/pricing-plans")
+@require_permission(Permission.BILLING_ADMIN)
+async def list_pricing_plans(
+    status: Optional[PricingPlanStatus] = None,
+    include_discontinued: bool = False,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """List all pricing plans"""
+    query = db.query(PricingPlan)
+    
+    if status:
+        query = query.filter(PricingPlan.status == status)
+    elif not include_discontinued:
+        query = query.filter(
+            PricingPlan.status != PricingPlanStatus.DISCONTINUED
+        )
+    
+    plans = query.order_by(PricingPlan.amount).all()
+    
+    return {
+        "plans": [
+            {
+                "id": plan.id,
+                "stripe_price_id": plan.stripe_price_id,
+                "name": plan.name,
+                "amount": plan.amount,
+                "currency": plan.currency,
+                "interval": plan.interval,
+                "status": plan.status,
+                "features": plan.features,
+                "replacement_plan_id": plan.replacement_plan_id,
+                "sunset_date": plan.sunset_date
+            }
+            for plan in plans
+        ]
+    }
+
+
+@router.put("/pricing-plans/{plan_id}")
+@require_permission(Permission.BILLING_ADMIN)
+async def update_pricing_plan(
+    plan_id: int,
+    update: PricingPlanUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Update pricing plan status and migration settings"""
+    try:
+        plan = subscription_management_service.update_plan_status(
+            db=db,
+            plan_id=plan_id,
+            status=update.status,
+            replacement_plan_id=update.replacement_plan_id,
+            migration_strategy=update.migration_strategy,
+            sunset_date=update.sunset_date,
+            admin_user_id=admin_user.id
+        )
+        
+        return {
+            "success": True,
+            "message": f"Plan {plan.name} updated successfully",
+            "plan": {
+                "id": plan.id,
+                "name": plan.name,
+                "status": plan.status,
+                "replacement_plan_id": plan.replacement_plan_id
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error updating pricing plan: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Individual Subscription Management ====================
+
+@router.get("/subscriptions/{subscription_id}")
+@require_permission(Permission.BILLING_ADMIN)
+async def get_subscription_details(
+    subscription_id: str,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Get detailed subscription information"""
+    # Get from local database
+    package = db.query(Package).filter(
+        Package.stripe_subscription_id == subscription_id
+    ).first()
+    
+    if not package:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    
+    # Get customer
+    customer = db.query(Customer).filter(
+        Customer.id == package.customer_id
+    ).first()
+    
+    # Get from Stripe for latest info
+    try:
+        stripe_sub = subscription_management_service.stripe.stripe.Subscription.retrieve(
+            subscription_id
+        )
+        
+        return {
+            "subscription": {
+                "id": subscription_id,
+                "customer": {
+                    "id": customer.id,
+                    "email": customer.email,
+                    "name": customer.name
+                },
+                "plan": {
+                    "id": stripe_sub.items.data[0].price.id,
+                    "product": stripe_sub.items.data[0].price.product,
+                    "amount": stripe_sub.items.data[0].price.unit_amount
+                },
+                "status": stripe_sub.status,
+                "current_period_start": stripe_sub.current_period_start,
+                "current_period_end": stripe_sub.current_period_end,
+                "cancel_at_period_end": stripe_sub.cancel_at_period_end,
+                "metadata": stripe_sub.metadata
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error fetching subscription from Stripe: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/subscriptions/{subscription_id}")
+@require_permission(Permission.BILLING_ADMIN)
+async def update_subscription(
+    subscription_id: str,
+    update: SubscriptionUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Update a subscription (change plan, cancel, etc.)"""
+    try:
+        # If changing plan, create a migration
+        if update.plan_id:
+            migration = subscription_management_service.create_migration(
+                db=db,
+                subscription_id=subscription_id,
+                target_plan_id=update.plan_id,
+                strategy=MigrationStrategy.IMMEDIATE,
+                admin_user_id=admin_user.id,
+                reason=f"Admin update by {admin_user.email}"
+            )
+            
+            return {
+                "success": True,
+                "message": "Subscription updated",
+                "migration_id": migration.id
+            }
+        
+        # Handle other updates
+        update_params = {}
+        if update.cancel_at_period_end is not None:
+            update_params["cancel_at_period_end"] = update.cancel_at_period_end
+        if update.metadata:
+            update_params["metadata"] = update.metadata
+        
+        if update_params:
+            subscription_management_service.stripe.stripe.Subscription.modify(
+                subscription_id,
+                **update_params
+            )
+        
+        return {
+            "success": True,
+            "message": "Subscription updated"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating subscription: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Migration Management ====================
+
+@router.post("/migrations")
+@require_permission(Permission.BILLING_ADMIN)
+async def create_migration(
+    migration: MigrationCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Create a subscription migration"""
+    try:
+        result = subscription_management_service.create_migration(
+            db=db,
+            subscription_id=migration.subscription_id,
+            target_plan_id=migration.target_plan_id,
+            strategy=migration.strategy,
+            admin_user_id=admin_user.id,
+            scheduled_for=migration.scheduled_for,
+            reason=migration.reason,
+            preserve_billing_date=migration.preserve_billing_date,
+            notify_customer=migration.notify_customer
+        )
+        
+        return {
+            "success": True,
+            "message": "Migration created",
+            "migration": {
+                "id": result.id,
+                "subscription_id": result.subscription_id,
+                "status": result.status,
+                "scheduled_for": result.scheduled_for
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating migration: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/migrations/{migration_id}/execute")
+@require_permission(Permission.BILLING_ADMIN)
+async def execute_migration(
+    migration_id: int,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Execute a pending migration"""
+    try:
+        result = subscription_management_service.execute_migration(
+            db=db,
+            migration_id=migration_id,
+            admin_user_id=admin_user.id
+        )
+        
+        return {
+            "success": True,
+            "message": "Migration executed",
+            "migration": {
+                "id": result.id,
+                "status": result.status,
+                "completed_at": result.completed_at
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error executing migration: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/migrations")
+@require_permission(Permission.BILLING_ADMIN)
+async def list_migrations(
+    status: Optional[MigrationStatus] = None,
+    subscription_id: Optional[str] = None,
+    limit: int = Query(50, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """List subscription migrations"""
+    query = db.query(SubscriptionMigration)
+    
+    if status:
+        query = query.filter(SubscriptionMigration.status == status)
+    if subscription_id:
+        query = query.filter(SubscriptionMigration.subscription_id == subscription_id)
+    
+    total = query.count()
+    migrations = query.order_by(
+        SubscriptionMigration.created_at.desc()
+    ).offset(offset).limit(limit).all()
+    
+    return {
+        "total": total,
+        "migrations": [
+            {
+                "id": m.id,
+                "subscription_id": m.subscription_id,
+                "source_plan": m.source_plan.name if m.source_plan else None,
+                "target_plan": m.target_plan.name if m.target_plan else None,
+                "status": m.status,
+                "strategy": m.strategy,
+                "scheduled_for": m.scheduled_for,
+                "completed_at": m.completed_at,
+                "error_message": m.error_message
+            }
+            for m in migrations
+        ]
+    }
+
+
+# ==================== Bulk Migration ====================
+
+@router.post("/bulk-migrations")
+@require_permission(Permission.BILLING_ADMIN)
+async def create_bulk_migration(
+    bulk_migration: BulkMigrationCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Create a bulk migration job"""
+    try:
+        job = subscription_management_service.create_bulk_migration(
+            db=db,
+            name=bulk_migration.name,
+            source_plan_ids=bulk_migration.source_plan_ids,
+            target_plan_id=bulk_migration.target_plan_id,
+            strategy=bulk_migration.strategy,
+            admin_user_id=admin_user.id,
+            criteria=bulk_migration.criteria,
+            scheduled_for=bulk_migration.scheduled_for,
+            dry_run=bulk_migration.dry_run,
+            notify_customers=bulk_migration.notify_customers,
+            require_approval=bulk_migration.require_approval
+        )
+        
+        # Execute immediately if not requiring approval and scheduled for now
+        if not job.require_approval and job.scheduled_for <= datetime.utcnow():
+            background_tasks.add_task(
+                subscription_management_service.execute_bulk_migration,
+                db, job.id, admin_user.id
+            )
+        
+        return {
+            "success": True,
+            "message": f"Bulk migration job created for {job.total_subscriptions} subscriptions",
+            "job": {
+                "id": job.id,
+                "job_id": job.job_id,
+                "name": job.name,
+                "total_subscriptions": job.total_subscriptions,
+                "status": job.status,
+                "require_approval": job.require_approval
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating bulk migration: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/bulk-migrations/{job_id}/approve")
+@require_permission(Permission.BILLING_ADMIN)
+async def approve_bulk_migration(
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Approve a bulk migration job"""
+    job = db.query(BulkMigrationJob).filter(
+        BulkMigrationJob.id == job_id
+    ).first()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if not job.require_approval:
+        raise HTTPException(status_code=400, detail="Job does not require approval")
+    
+    if job.approved_by:
+        raise HTTPException(status_code=400, detail="Job already approved")
+    
+    job.approved_by = admin_user.id
+    db.commit()
+    
+    # Execute if scheduled for now or past
+    if job.scheduled_for <= datetime.utcnow():
+        background_tasks.add_task(
+            subscription_management_service.execute_bulk_migration,
+            db, job.id, admin_user.id
+        )
+    
+    return {
+        "success": True,
+        "message": "Bulk migration approved and queued for execution"
+    }
+
+
+@router.get("/bulk-migrations")
+@require_permission(Permission.BILLING_ADMIN)
+async def list_bulk_migrations(
+    status: Optional[MigrationStatus] = None,
+    limit: int = Query(20, le=50),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """List bulk migration jobs"""
+    query = db.query(BulkMigrationJob)
+    
+    if status:
+        query = query.filter(BulkMigrationJob.status == status)
+    
+    total = query.count()
+    jobs = query.order_by(
+        BulkMigrationJob.created_at.desc()
+    ).offset(offset).limit(limit).all()
+    
+    return {
+        "total": total,
+        "jobs": [
+            {
+                "id": job.id,
+                "job_id": job.job_id,
+                "name": job.name,
+                "status": job.status,
+                "total_subscriptions": job.total_subscriptions,
+                "processed_count": job.processed_count,
+                "success_count": job.success_count,
+                "failed_count": job.failed_count,
+                "created_at": job.created_at,
+                "completed_at": job.completed_at,
+                "require_approval": job.require_approval,
+                "approved_by": job.approved_by
+            }
+            for job in jobs
+        ]
+    }
+
+
+# ==================== Grandfathering ====================
+
+@router.post("/grandfather-subscriptions")
+@require_permission(Permission.BILLING_ADMIN)
+async def grandfather_subscriptions(
+    request: GrandfatherRequest,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Mark subscriptions as grandfathered on a deprecated plan"""
+    try:
+        result = subscription_management_service.grandfather_subscriptions(
+            db=db,
+            plan_id=request.plan_id,
+            admin_user_id=admin_user.id,
+            criteria=request.criteria
+        )
+        
+        return {
+            "success": True,
+            "message": f"Grandfathered {result['grandfathered_count']} subscriptions",
+            "details": result
+        }
+    except Exception as e:
+        logger.error(f"Error grandfathering subscriptions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Transition Rules ====================
+
+@router.post("/transition-rules")
+@require_permission(Permission.BILLING_ADMIN)
+async def create_transition_rule(
+    rule: TransitionRuleCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Create an automatic plan transition rule"""
+    try:
+        result = subscription_management_service.create_transition_rule(
+            db=db,
+            name=rule.name,
+            source_plan_id=rule.source_plan_id,
+            target_plan_id=rule.target_plan_id,
+            strategy=rule.strategy,
+            conditions=rule.conditions,
+            effective_date=rule.effective_date,
+            auto_approve=rule.auto_approve,
+            notify_customer=rule.notify_customer
+        )
+        
+        return {
+            "success": True,
+            "message": "Transition rule created",
+            "rule": {
+                "id": result.id,
+                "name": result.name,
+                "source_plan_id": result.source_plan_id,
+                "target_plan_id": result.target_plan_id,
+                "is_active": result.is_active
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error creating transition rule: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/transition-rules/apply")
+@require_permission(Permission.BILLING_ADMIN)
+async def apply_transition_rules(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Apply all active transition rules"""
+    background_tasks.add_task(
+        subscription_management_service.apply_transition_rules,
+        db, admin_user.id
+    )
+    
+    return {
+        "success": True,
+        "message": "Transition rules application started in background"
+    }
+
+
+# ==================== Audit Trail ====================
+
+@router.get("/audit-trail")
+@require_permission(Permission.BILLING_ADMIN)
+async def get_audit_trail(
+    subscription_id: Optional[str] = None,
+    customer_id: Optional[int] = None,
+    action: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    limit: int = Query(50, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Get subscription audit trail"""
+    query = db.query(SubscriptionAuditLog)
+    
+    if subscription_id:
+        query = query.filter(SubscriptionAuditLog.subscription_id == subscription_id)
+    if customer_id:
+        query = query.filter(SubscriptionAuditLog.customer_id == customer_id)
+    if action:
+        query = query.filter(SubscriptionAuditLog.action == action)
+    if start_date:
+        query = query.filter(SubscriptionAuditLog.created_at >= start_date)
+    if end_date:
+        query = query.filter(SubscriptionAuditLog.created_at <= end_date)
+    
+    total = query.count()
+    logs = query.order_by(
+        SubscriptionAuditLog.created_at.desc()
+    ).offset(offset).limit(limit).all()
+    
+    return {
+        "total": total,
+        "audit_logs": [
+            {
+                "id": log.id,
+                "subscription_id": log.subscription_id,
+                "customer_id": log.customer_id,
+                "action": log.action,
+                "changes": log.changes,
+                "initiated_by": log.user.email if log.user else "System",
+                "initiated_by_type": log.initiated_by_type,
+                "reason": log.reason,
+                "created_at": log.created_at
+            }
+            for log in logs
+        ]
+    }
+
+
+# ==================== Analytics ====================
+
+@router.get("/migration-analytics")
+@require_permission(Permission.BILLING_ADMIN)
+async def get_migration_analytics(
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin)
+):
+    """Get migration analytics and statistics"""
+    query = db.query(SubscriptionMigration)
+    
+    if start_date:
+        query = query.filter(SubscriptionMigration.created_at >= start_date)
+    if end_date:
+        query = query.filter(SubscriptionMigration.created_at <= end_date)
+    
+    # Get counts by status
+    status_counts = {}
+    for status in MigrationStatus:
+        count = query.filter(SubscriptionMigration.status == status).count()
+        status_counts[status.value] = count
+    
+    # Get counts by strategy
+    strategy_counts = {}
+    for strategy in MigrationStrategy:
+        count = query.filter(SubscriptionMigration.strategy == strategy).count()
+        strategy_counts[strategy.value] = count
+    
+    # Get average completion time
+    completed_migrations = query.filter(
+        SubscriptionMigration.status == MigrationStatus.COMPLETED,
+        SubscriptionMigration.completed_at.isnot(None),
+        SubscriptionMigration.started_at.isnot(None)
+    ).all()
+    
+    avg_completion_time = None
+    if completed_migrations:
+        total_time = sum(
+            (m.completed_at - m.started_at).total_seconds()
+            for m in completed_migrations
+        )
+        avg_completion_time = total_time / len(completed_migrations)
+    
+    return {
+        "total_migrations": query.count(),
+        "status_breakdown": status_counts,
+        "strategy_breakdown": strategy_counts,
+        "average_completion_time_seconds": avg_completion_time,
+        "active_bulk_jobs": db.query(BulkMigrationJob).filter(
+            BulkMigrationJob.status == MigrationStatus.IN_PROGRESS
+        ).count()
+    }

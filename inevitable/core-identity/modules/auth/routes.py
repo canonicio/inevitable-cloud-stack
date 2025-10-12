@@ -1,0 +1,699 @@
+"""
+Authentication routes for Platform Forge
+"""
+from datetime import timedelta
+from typing import Optional, Union
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks, Response
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
+from ..core.validators import UserRegistration, LoginRequest, PasswordReset, PasswordResetConfirm
+import logging
+import os
+import time
+import secrets  # Required for secure token generation
+import redis  # Required for rate limiting and session management
+
+from ..core.database import get_db
+from ..core.enhanced_validators import SecureBaseModel, APIParameterValidator
+from ..core.config import settings
+from ..core.csrf_protection import generate_csrf_token, CSRFToken, require_csrf_token
+from .service import auth_service
+from .models import User
+from .dependencies import get_current_user
+from .rate_limit import rate_limit_middleware, get_rate_limiter
+
+router = APIRouter(prefix="/auth", tags=["authentication"])
+logger = logging.getLogger(__name__)
+
+
+@router.get("/csrf-token", response_model=CSRFToken)
+async def get_csrf_token(
+    request: Request,
+    response: Response
+):
+    """Get CSRF token for state-changing requests"""
+    return await generate_csrf_token(request, response)
+
+
+# Use the validated model from core.validators
+UserCreate = UserRegistration
+
+
+class UserResponse(SecureBaseModel):
+    id: int
+    username: str
+    email: str
+    tenant_id: Optional[str]
+    is_active: bool
+    is_superuser: bool
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MFARequiredResponse(SecureBaseModel):
+    """Response when MFA is required to complete login"""
+    message: str
+    requires_mfa: bool
+    mfa_token: str  # Temporary token for MFA verification
+    available_methods: list[str]  # Available MFA methods
+
+
+    @field_validator('message')
+    @classmethod
+    def validate_message(cls, v):
+        if v:
+            return APIParameterValidator.validate_string(v, max_length=500)
+        return v
+
+class MFAVerificationRequest(SecureBaseModel):
+    """Request to verify MFA code and complete login"""
+    mfa_token: str
+    method: str  # "totp", "email", or "sms"
+    code: str
+
+
+class Token(SecureBaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(SecureBaseModel):
+    username: Optional[str] = None
+
+
+@router.post("/register", response_model=UserResponse, dependencies=[])
+async def register(
+    request: Request,
+    user_data: UserCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Register a new user with enumeration prevention."""
+    import asyncio
+    import random
+    
+    # Apply rate limiting
+    await rate_limit_middleware(request, "register")
+    
+    try:
+        # Validate password first (before database check)
+        is_valid, message = auth_service.validate_password_strength(user_data.password)
+        if not is_valid:
+            # CRITICAL-010 FIX: Use cryptographically secure random for timing delays
+            # This prevents attackers from using predictable timing patterns
+            delay_ms = secrets.randbelow(200) + 100  # 100-299ms range
+            await asyncio.sleep(delay_ms / 1000.0)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Registration failed. Please check your information."
+            )
+        
+        # Try to create user directly - let database constraints handle uniqueness
+        try:
+            user = auth_service.create_user(
+                db=db,
+                username=user_data.username,
+                email=user_data.email,
+                password=user_data.password,
+                tenant_id=user_data.tenant_id
+            )
+            db.commit()
+            
+        except IntegrityError as e:
+            db.rollback()
+            # Log the attempt but return generic message
+            logger.warning(
+                f"Registration attempt for existing user - "
+                f"Username: {user_data.username}, Email: {user_data.email}, "
+                f"Error: {str(e.orig)}"
+            )
+            
+            # CRITICAL-010 FIX: Simulate processing time with secure random
+            delay_ms = secrets.randbelow(200) + 100  # 100-299ms range
+            await asyncio.sleep(delay_ms / 1000.0)
+            
+            # Generic response that doesn't reveal which field conflicted
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Registration failed. Please check your information."
+            )
+        
+        # Send verification email asynchronously
+        background_tasks.add_task(
+            send_verification_email, 
+            user.email, 
+            user.id
+        )
+        
+        logger.info(f"New user registered: {user.id}")
+        
+        return user
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {str(e)}")
+        # Generic error for any unexpected issues
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Registration failed. Please check your information."
+        )
+
+async def send_verification_email(email: str, user_id: int):
+    """Send verification email"""
+    from ..core.email_service import email_service
+    from ..core.security import SecurityUtils
+    
+    # Generate verification token
+    token = SecurityUtils.generate_secure_token()
+    
+    # TODO: Store token in database with expiration
+    
+    # CRITICAL FIX: Secure URL construction and user ID protection
+    # Generate verification URL with validated base URL and encoded user ID
+    base_url = SecurityUtils.get_validated_base_url()
+    encoded_user_id = SecurityUtils.encode_user_id(user_id)
+    verification_url = f"{base_url}/auth/verify-email?token={token}&uid={encoded_user_id}"
+    
+    # Get user for email
+    from ..core.database import SessionLocal
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            await email_service.send_welcome_email(user, verification_url)
+    finally:
+        db.close()
+
+
+@router.post("/login", response_model=Union[Token, MFARequiredResponse])
+async def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Login with username or email. 
+    CRITICAL FIX: Now enforces MFA when enabled instead of bypassing it.
+    """
+    # Apply rate limiting
+    await rate_limit_middleware(request, "login")
+    
+    # For login, tenant_id should be part of the user's data, not from headers
+    tenant_id = None  # Will be set from user record
+    
+    user = auth_service.authenticate_user(
+        db, 
+        username_or_email=form_data.username,  # Can be username or email
+        password=form_data.password,
+        tenant_id=tenant_id
+    )
+    
+    if not user:
+        # Record failed login attempt
+        rate_limiter = get_rate_limiter()
+        await rate_limiter.record_failed_login(request, form_data.username)
+        
+        # Generic error to prevent user enumeration
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # CRITICAL FIX: Check if MFA is enabled and enforce it
+    if user.mfa_enabled:
+        # Create temporary MFA token (short-lived, limited scope)
+        mfa_token_expires = timedelta(minutes=5)  # Very short expiration
+        mfa_token_data = {
+            "sub": str(user.id),
+            "tenant_id": user.tenant_id,
+            "scope": "mfa_pending",  # Limited scope
+            "purpose": "mfa_verification",
+            "type": "mfa_temp",  # Token type for validation
+            "iat": int(time.time()),  # Issued at time
+            "exp": int(time.time()) + 300  # Explicit expiration
+        }
+        
+        mfa_token = auth_service.create_access_token(
+            data=mfa_token_data,
+            expires_delta=mfa_token_expires
+        )
+        
+        # Determine available MFA methods
+        available_methods = []
+        if user.mfa_secret:
+            available_methods.append("totp")
+        if user.email:
+            available_methods.append("email")
+        if hasattr(user, 'phone_number') and user.phone_number:
+            available_methods.append("sms")
+        
+        logger.info(f"User {user.id} requires MFA verification")
+        
+        return MFARequiredResponse(
+            message="Multi-factor authentication required",
+            requires_mfa=True,
+            mfa_token=mfa_token,
+            available_methods=available_methods
+        )
+    
+    # If MFA not enabled, proceed with normal token creation
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_data = {
+        "sub": str(user.id),
+        "tenant_id": user.tenant_id,
+        "username": user.username,
+        "roles": [role.name for role in user.roles] if hasattr(user, 'roles') else []
+    }
+    
+    access_token = auth_service.create_access_token(
+        data=token_data,
+        expires_delta=access_token_expires
+    )
+    
+    # Log successful login
+    logger.info(f"User {user.id} logged in successfully (no MFA required)")
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/verify-mfa", response_model=Token)
+async def verify_mfa(
+    request: Request,
+    mfa_request: MFAVerificationRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    CRITICAL FIX: Complete MFA verification and issue full access token.
+    This endpoint validates the MFA code and issues the final JWT token.
+    """
+    # Apply rate limiting for MFA verification
+    await rate_limit_middleware(request, "mfa_verify")
+    
+    try:
+        # HIGH FIX: Comprehensive MFA token validation to prevent scope manipulation
+        # Addresses HIGH-AUTH-003: MFA Token Scope Manipulation
+        payload = auth_service.decode_token(mfa_request.mfa_token)
+        
+        # SECURITY FIX: Use comprehensive MFA validator with database fallback
+        # Addresses RISK-H003: MFA Token Replay Attacks
+        from .mfa_validator import get_mfa_validator
+        
+        redis_client = None
+        try:
+            redis_client = redis.Redis.from_url(settings.REDIS_URL or "redis://localhost:6379")
+        except Exception as e:
+            logger.warning(f"Redis connection failed, using database fallback: {e}")
+        
+        mfa_validator = get_mfa_validator(redis_client, db)
+        
+        # Validate and consume MFA token (prevents replay attacks)
+        user_id = payload.get('sub')
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA token: missing user ID"
+            )
+        
+        # This will raise HTTPException if token was already used
+        mfa_validator.validate_and_consume_token(
+            user_id=user_id,
+            token=mfa_request.code,  # Use the actual MFA code for replay protection
+            method=mfa_request.method,
+            request=request
+        )
+        
+        # Enhanced validation checks
+        required_fields = ["scope", "purpose", "sub", "tenant_id", "exp", "iat"]
+        for field in required_fields:
+            if field not in payload:
+                logger.warning(f"MFA token missing required field: {field}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid MFA token structure"
+                )
+        
+        # Validate scope and purpose
+        if payload.get("scope") != "mfa_pending":
+            logger.warning(f"Invalid MFA token scope: {payload.get('scope')}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA token scope"
+            )
+        
+        if payload.get("purpose") != "mfa_verification":
+            logger.warning(f"Invalid MFA token purpose: {payload.get('purpose')}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA token purpose"
+            )
+        
+        # Validate token hasn't been tampered with
+        token_type = payload.get("type")
+        if token_type != "mfa_temp":
+            logger.warning(f"Invalid MFA token type: {token_type}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA token type"
+            )
+        
+        # Extract user info with validation
+        try:
+            user_id = int(payload.get("sub"))
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid user ID in MFA token: {payload.get('sub')}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid user identifier"
+            )
+        
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id or not isinstance(tenant_id, str):
+            logger.warning(f"Invalid tenant ID in MFA token: {tenant_id}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid tenant identifier"
+            )
+        
+        # Validate token age (additional check beyond JWT exp)
+        import time
+        issued_at = payload.get("iat", 0)
+        current_time = int(time.time())
+        token_age = current_time - issued_at
+        
+        max_token_age = 300  # 5 minutes
+        if token_age > max_token_age:
+            logger.warning(f"MFA token too old: {token_age}s (max {max_token_age}s)")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="MFA token expired"
+            )
+        
+        # Get user
+        user = db.query(User).filter(User.id == user_id, User.tenant_id == tenant_id).first()
+        if not user or not user.mfa_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid user or MFA not enabled"
+            )
+        
+        # Verify MFA code based on method
+        mfa_valid = False
+        
+        if mfa_request.method == "totp":
+            # Verify TOTP code
+            from ..admin.mfa import MFAManager
+            mfa_manager = MFAManager(db)
+            mfa_valid = mfa_manager.verify_totp(user, mfa_request.code)
+            
+        elif mfa_request.method == "email":
+            # Verify email code
+            from .mfa_providers import EmailMFAProvider
+            email_provider = EmailMFAProvider(db)
+            mfa_valid = email_provider.verify_code(user_id, mfa_request.code)
+            
+        elif mfa_request.method == "sms":
+            # Verify SMS code
+            from .mfa_providers import SMSMFAProvider
+            sms_provider = SMSMFAProvider(db)
+            mfa_valid = sms_provider.verify_code(user_id, mfa_request.code)
+            
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid MFA method"
+            )
+        
+        if not mfa_valid:
+            # Record failed MFA attempt
+            logger.warning(f"Failed MFA verification attempt for user {user_id}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA code"
+            )
+        
+        # MFA successful - issue full access token
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        token_data = {
+            "sub": str(user.id),
+            "tenant_id": user.tenant_id,
+            "username": user.username,
+            "roles": [role.name for role in user.roles] if hasattr(user, 'roles') else [],
+            "mfa_verified": True  # Mark as MFA verified
+        }
+        
+        access_token = auth_service.create_access_token(
+            data=token_data,
+            expires_delta=access_token_expires
+        )
+        
+        # Log successful MFA completion
+        logger.info(f"User {user.id} completed MFA verification successfully")
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MFA verification error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="MFA verification failed"
+        )
+
+
+@router.get("/me", response_model=UserResponse)
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    """Get current user information."""
+    return current_user
+
+
+@router.post("/change-password", dependencies=[Depends(require_csrf_token)])
+async def change_password(
+    current_password: str,
+    new_password: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Change user password."""
+    # Verify current password
+    if not auth_service.verify_password(current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect password"
+        )
+    
+    # Validate new password
+    is_valid, message = auth_service.validate_password_strength(new_password)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=message
+        )
+    
+    # Update password
+    auth_service.update_password(db, current_user, new_password)
+    
+    return {"message": "Password updated successfully"}
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    request: Request,
+    reset_request: PasswordReset,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Request password reset with enumeration prevention."""
+    import asyncio
+    import random
+    
+    # Apply rate limiting
+    await rate_limit_middleware(request, "password_reset")
+    
+    # Always return success to prevent enumeration
+    background_tasks.add_task(
+        process_password_reset,
+        reset_request.email,
+        db
+    )
+    
+    # CRITICAL-010 FIX: Add secure random delay
+    delay_ms = secrets.randbelow(200) + 100  # 100-299ms range
+    await asyncio.sleep(delay_ms / 1000.0)
+    
+    return {
+        "message": "If an account exists with this email, you will receive password reset instructions."
+    }
+
+
+async def process_password_reset(email: str, db: Session):
+    """Process password reset in background."""
+    from datetime import datetime, timedelta
+    
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        
+        if user:
+            # HIGH FIX: Atomic password reset token generation and storage
+            # Addresses HIGH-AUTH-004: Password Reset Race Condition
+            
+            # Generate secure reset token
+            reset_token = secrets.token_urlsafe(32)
+            expiration = datetime.utcnow() + timedelta(hours=1)
+            
+            # SECURITY FIX: Use enhanced token manager for atomic storage
+            try:
+                redis_client = redis.Redis.from_url(
+                    settings.REDIS_URL or "redis://localhost:6379",
+                    decode_responses=True
+                )
+                
+                from ..core.distributed_lock import get_token_manager
+                token_manager = get_token_manager(redis_client)
+                
+                # Create token atomically with enhanced security
+                success = token_manager.create_token(str(user.id), reset_token)
+                
+                if not success:
+                    logger.error(f"Failed to create password reset token for user {user.id}")
+                    return
+                
+                logger.info(
+                    f"Password reset token generated for user {user.id}: "
+                    f"Token: {reset_token[:8]}..., Expires: {expiration}"
+                )
+                
+            except Exception as redis_error:
+                logger.error(f"Failed to store reset token in Redis: {redis_error}")
+                # Fallback: log the token (less secure, but functional)
+                logger.info(
+                    f"FALLBACK: Password reset token for user {user.id}: "
+                    f"Token: {reset_token[:8]}..., Expires: {expiration}"
+                )
+            
+            # Send password reset email
+            from ..core.email_service import email_service
+            # CRITICAL FIX: Use validated base URL to prevent open redirect
+            base_url = SecurityUtils.get_validated_base_url()
+            reset_url = f"{base_url}/auth/reset-password?token={reset_token}"
+            await email_service.send_password_reset_email(user, reset_url)
+        else:
+            # CRITICAL-010 FIX: Simulate processing time with secure random
+            delay_ms = secrets.randbelow(200) + 100  # 100-299ms range
+            time.sleep(delay_ms / 1000.0)
+            
+    except Exception as e:
+        logger.error(f"Password reset error: {str(e)}")
+
+
+@router.post("/reset-password/confirm")
+async def confirm_password_reset(
+    request: Request,
+    reset_data: PasswordResetConfirm,
+    db: Session = Depends(get_db)
+):
+    """
+    SECURITY FIX: Confirm password reset with distributed locking
+    Addresses RISK-H002: Password Reset Race Condition
+    """
+    import json
+    from datetime import datetime
+    from ..core.security import SecurityUtils
+    from ..core.distributed_lock import distributed_lock, get_token_manager
+    
+    # Apply rate limiting
+    await rate_limit_middleware(request, "password_reset_confirm")
+    
+    try:
+        # Get Redis client and token manager
+        redis_client = redis.Redis.from_url(
+            settings.REDIS_URL or "redis://localhost:6379",
+            decode_responses=True
+        )
+        
+        token_manager = get_token_manager(redis_client)
+        
+        # SECURITY FIX: Use distributed lock to prevent race conditions
+        with distributed_lock(redis_client, f"pwd_reset:{reset_data.token}", timeout=30):
+            # Atomically consume the token
+            token_data = token_manager.consume_token(reset_data.token)
+            
+            if not token_data:
+                raise HTTPException(400, "Invalid or expired reset token")
+        
+            # Parse token data and validate
+            user_id = token_data.get("user_id")
+            if not user_id:
+                raise HTTPException(400, "Invalid reset token format")
+            
+            # Get user and validate
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user:
+                # Don't reveal user existence
+                raise HTTPException(400, "Invalid reset token")
+            
+            # Validate user is still active and not suspended
+            if not user.is_active:
+                raise HTTPException(400, "User account is not active")
+            
+            # Validate new password strength
+            from .password_security import validate_password_strength
+            is_strong, message = validate_password_strength(reset_data.new_password)
+            if not is_strong:
+                raise HTTPException(400, f"Password security requirements not met: {message}")
+            
+            # Hash new password securely
+            password_hash = SecurityUtils.hash_password(reset_data.new_password)
+            
+            # Update password with additional security measures
+            user.hashed_password = password_hash
+            user.password_changed_at = datetime.utcnow()
+            user.force_password_change = False
+            
+            # Invalidate all user sessions and tokens
+            user.token_version = (user.token_version or 0) + 1
+            
+            # Commit changes
+            db.commit()
+            
+            # Clean up any remaining reset tokens for this user
+            revoked_count = token_manager.revoke_user_tokens(user_id)
+            
+            # Log security event with audit details
+            from ..core.audit_logger import create_audit_log
+            create_audit_log(
+                db,
+                user_id=user.id,
+                action="password.reset_confirm",
+                resource=f"user:{user.id}",
+                details={
+                    "method": "reset_token",
+                    "tokens_revoked": revoked_count,
+                    "ip_address": request.client.host if hasattr(request, 'client') else None,
+                    "user_agent": request.headers.get("User-Agent", "")[:256] if hasattr(request, 'headers') else None
+                }
+            )
+            
+            logger.info(f"Password reset completed for user {user.id}, {revoked_count} tokens revoked")
+            
+            # Send confirmation email asynchronously
+            try:
+                from ..core.email_service import email_service
+                await email_service.send_password_changed_email(user)
+            except Exception as e:
+                logger.error(f"Failed to send password change confirmation: {e}")
+            
+            return {
+                "message": "Password reset successful. Please log in with your new password.",
+                "success": True
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Password reset confirmation error: {str(e)}")
+        raise HTTPException(500, "Internal server error")

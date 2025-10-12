@@ -1,0 +1,408 @@
+from datetime import datetime
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field, validator
+import json
+
+from modules.core.database import get_db
+from modules.core.security import SecurityUtils
+from modules.core.enhanced_validators import SecureBaseModel
+from modules.auth.dependencies import get_current_user
+from modules.privacy.models import ConsentType, DataRequestType, DataRequestStatus
+from modules.privacy.consent import ConsentManager
+from modules.privacy.services import DataExportService, DataDeletionService, DataRetentionService
+
+router = APIRouter(prefix="/api/privacy", tags=["privacy"])
+
+# Pydantic models for API
+class ConsentUpdate(SecureBaseModel):
+    consent_type: ConsentType
+    granted: bool
+    ip_address: Optional[str] = None
+    
+class ConsentResponse(SecureBaseModel):
+    id: int
+    user_id: int
+    consent_type: ConsentType
+    granted: bool
+    granted_at: Optional[datetime]
+    revoked_at: Optional[datetime]
+    version: str
+    ip_address: Optional[str]
+    
+    class Config:
+        from_attributes = True
+
+class BulkConsentUpdate(SecureBaseModel):
+    consents: List[ConsentUpdate]
+    ip_address: Optional[str] = None
+
+class DataRequestCreate(SecureBaseModel):
+    request_type: DataRequestType
+    reason: Optional[str] = Field(None, max_length=500)
+    
+class DataRequestResponse(SecureBaseModel):
+    id: int
+    user_id: int
+    request_type: DataRequestType
+    status: DataRequestStatus
+    reason: Optional[str]
+    requested_at: datetime
+    completed_at: Optional[datetime]
+    response_data: Optional[dict]
+    
+    class Config:
+        from_attributes = True
+
+class PrivacyPolicyResponse(SecureBaseModel):
+    id: int
+    version: str
+    content: str
+    effective_date: datetime
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Consent endpoints
+@router.post("/consent", response_model=ConsentResponse)
+def update_consent(
+    consent_update: ConsentUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update user consent for a specific type"""
+    consent_manager = ConsentManager()
+    
+    consent = consent_manager.record_consent(
+        db=db,
+        user_id=current_user["user_id"],
+        consent_type=consent_update.consent_type,
+        granted=consent_update.granted,
+        ip_address=consent_update.ip_address
+    )
+    
+    return consent
+
+@router.post("/consent/bulk", response_model=List[ConsentResponse])
+def update_bulk_consent(
+    bulk_update: BulkConsentUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update multiple consent types at once"""
+    consent_manager = ConsentManager()
+    consents = []
+    
+    for consent_update in bulk_update.consents:
+        consent = consent_manager.record_consent(
+            db=db,
+            user_id=current_user["user_id"],
+            consent_type=consent_update.consent_type,
+            granted=consent_update.granted,
+            ip_address=bulk_update.ip_address or consent_update.ip_address
+        )
+        consents.append(consent)
+    
+    return consents
+
+@router.get("/consent", response_model=List[ConsentResponse])
+def get_user_consents(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all current consent statuses for the user"""
+    consent_manager = ConsentManager()
+    consents = consent_manager.get_user_consents(db, current_user["user_id"])
+    return consents
+
+@router.get("/consent/{consent_type}", response_model=ConsentResponse)
+def get_consent_status(
+    consent_type: ConsentType,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get consent status for a specific type"""
+    consent_manager = ConsentManager()
+    consent = consent_manager.get_consent_status(
+        db, current_user["user_id"], consent_type
+    )
+    
+    if not consent:
+        raise HTTPException(status_code=404, detail="Consent not found")
+    
+    return consent
+
+@router.get("/consent/history/{consent_type}", response_model=List[ConsentResponse])
+def get_consent_history(
+    consent_type: ConsentType,
+    limit: int = Query(10, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get consent history for a specific type"""
+    consent_manager = ConsentManager()
+    history = consent_manager.get_consent_history(
+        db, current_user["user_id"], consent_type, limit
+    )
+    return history
+
+# Data request endpoints
+@router.post("/data-request", response_model=DataRequestResponse)
+def create_data_request(
+    request: DataRequestCreate,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a data request (export or deletion)"""
+    from modules.privacy.models import DataRequest
+    
+    # Check for pending requests
+    existing = db.query(DataRequest).filter(
+        DataRequest.user_id == current_user["user_id"],
+        DataRequest.request_type == request.request_type,
+        DataRequest.status.in_([DataRequestStatus.PENDING, DataRequestStatus.PROCESSING])
+    ).first()
+    
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"You already have a pending {request.request_type.value} request"
+        )
+    
+    # Create request
+    data_request = DataRequest(
+        user_id=current_user["user_id"],
+        tenant_id=current_user.get("tenant_id"),
+        request_type=request.request_type,
+        status=DataRequestStatus.PENDING,
+        reason=request.reason
+    )
+    db.add(data_request)
+    db.commit()
+    db.refresh(data_request)
+    
+    # Process in background
+    if request.request_type == DataRequestType.EXPORT:
+        background_tasks.add_task(
+            process_export_request,
+            data_request.id,
+            current_user["user_id"]
+        )
+    elif request.request_type == DataRequestType.DELETION:
+        background_tasks.add_task(
+            process_deletion_request,
+            data_request.id,
+            current_user["user_id"]
+        )
+    
+    return data_request
+
+@router.get("/data-request", response_model=List[DataRequestResponse])
+def get_data_requests(
+    status: Optional[DataRequestStatus] = None,
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get user's data requests"""
+    from modules.privacy.models import DataRequest
+    
+    query = db.query(DataRequest).filter(
+        DataRequest.user_id == current_user["user_id"]
+    )
+    
+    if status:
+        query = query.filter(DataRequest.status == status)
+    
+    requests = query.order_by(DataRequest.requested_at.desc()).limit(limit).all()
+    return requests
+
+@router.get("/data-request/{request_id}", response_model=DataRequestResponse)
+def get_data_request(
+    request_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get a specific data request"""
+    from modules.privacy.models import DataRequest
+    
+    data_request = db.query(DataRequest).filter(
+        DataRequest.id == request_id,
+        DataRequest.user_id == current_user["user_id"]
+    ).first()
+    
+    if not data_request:
+        raise HTTPException(status_code=404, detail="Data request not found")
+    
+    return data_request
+
+@router.get("/data-request/{request_id}/download")
+def download_data_export(
+    request_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download exported data"""
+    from modules.privacy.models import DataRequest
+    from fastapi.responses import JSONResponse, FileResponse
+    import tempfile
+    import os
+    
+    data_request = db.query(DataRequest).filter(
+        DataRequest.id == request_id,
+        DataRequest.user_id == current_user["user_id"],
+        DataRequest.request_type == DataRequestType.EXPORT,
+        DataRequest.status == DataRequestStatus.COMPLETED
+    ).first()
+    
+    if not data_request:
+        raise HTTPException(status_code=404, detail="Export not found or not ready")
+    
+    if not data_request.response_data:
+        raise HTTPException(status_code=404, detail="Export data not available")
+    
+    # Create temporary file
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.json',
+        delete=False
+    ) as tmp_file:
+        json.dump(data_request.response_data, tmp_file, indent=2, default=str)
+        tmp_path = tmp_file.name
+    
+    return FileResponse(
+        path=tmp_path,
+        filename=f"user_data_export_{current_user['user_id']}_{request_id}.json",
+        media_type="application/json",
+        background=BackgroundTasks().add_task(os.unlink, tmp_path)
+    )
+
+# Privacy policy endpoints
+@router.get("/policy/current", response_model=PrivacyPolicyResponse)
+def get_current_privacy_policy(db: Session = Depends(get_db)):
+    """Get the current privacy policy"""
+    from modules.privacy.models import PrivacyPolicy
+    
+    policy = db.query(PrivacyPolicy).filter(
+        PrivacyPolicy.is_active == True
+    ).order_by(PrivacyPolicy.effective_date.desc()).first()
+    
+    if not policy:
+        raise HTTPException(status_code=404, detail="No active privacy policy found")
+    
+    return policy
+
+@router.get("/policy/history", response_model=List[PrivacyPolicyResponse])
+def get_privacy_policy_history(
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db)
+):
+    """Get privacy policy version history"""
+    from modules.privacy.models import PrivacyPolicy
+    
+    policies = db.query(PrivacyPolicy).order_by(
+        PrivacyPolicy.effective_date.desc()
+    ).limit(limit).all()
+    
+    return policies
+
+# Background task functions
+async def process_export_request(request_id: int, user_id: int):
+    """Process data export request in background"""
+    from modules.core.database import SessionLocal
+    from modules.privacy.models import DataRequest, DataRequestStatus
+    
+    db = SessionLocal()
+    try:
+        # Update status to processing
+        data_request = db.query(DataRequest).filter(
+            DataRequest.id == request_id
+        ).first()
+        
+        if not data_request:
+            return
+        
+        data_request.status = DataRequestStatus.PROCESSING
+        db.commit()
+        
+        # Export data
+        export_service = DataExportService()
+        exported_data = export_service.export_user_data(db, user_id)
+        
+        # Update request with results
+        data_request.status = DataRequestStatus.COMPLETED
+        data_request.response_data = exported_data
+        data_request.completed_at = datetime.utcnow()
+        db.commit()
+        
+    except Exception as e:
+        # Mark as failed
+        if data_request:
+            data_request.status = DataRequestStatus.FAILED
+            data_request.response_data = {"error": str(e)}
+            data_request.completed_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+async def process_deletion_request(request_id: int, user_id: int):
+    """Process data deletion request in background"""
+    from modules.core.database import SessionLocal
+    from modules.privacy.models import DataRequest, DataRequestStatus
+    
+    db = SessionLocal()
+    try:
+        # Update status to processing
+        data_request = db.query(DataRequest).filter(
+            DataRequest.id == request_id
+        ).first()
+        
+        if not data_request:
+            return
+        
+        data_request.status = DataRequestStatus.PROCESSING
+        db.commit()
+        
+        # Delete data
+        deletion_service = DataDeletionService()
+        result = deletion_service.delete_user_data(db, user_id)
+        
+        # Update request with results
+        data_request.status = DataRequestStatus.COMPLETED
+        data_request.response_data = result
+        data_request.completed_at = datetime.utcnow()
+        db.commit()
+        
+    except Exception as e:
+        # Mark as failed
+        if data_request:
+            data_request.status = DataRequestStatus.FAILED
+            data_request.response_data = {"error": str(e)}
+            data_request.completed_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+# Admin endpoints (for privacy officers)
+@router.get("/admin/retention-check", dependencies=[Depends(get_current_user)])
+def check_data_retention(
+    dry_run: bool = Query(True),
+    db: Session = Depends(get_db)
+):
+    """Check which data should be deleted based on retention policies"""
+    # This would typically require admin permissions
+    retention_service = DataRetentionService()
+    
+    expired_data = retention_service.get_expired_data(db)
+    
+    if not dry_run:
+        deleted = retention_service.apply_retention_policies(db)
+        return {
+            "expired_data": expired_data,
+            "deleted_data": deleted
+        }
+    
+    return {"expired_data": expired_data, "dry_run": True}

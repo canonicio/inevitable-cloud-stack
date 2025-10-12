@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: platform-forge-db
+    environment:
+      POSTGRES_USER: platformforge
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-SecureDBPassword2025}
+      POSTGRES_DB: platformforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platformforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform-forge-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: platform-forge-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform-forge-network
+
+  app:
+    image: platform-forge-secure:latest
+    container_name: platform-forge-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://platformforge:${DB_PASSWORD:-SecureDBPassword2025}@postgres:5432/platformforge
+      REDIS_URL: redis://redis:6379
+      SECRET_KEY: ${SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      PLATFORM_FORGE_MASTER_KEY: ${PLATFORM_FORGE_MASTER_KEY}
+      STRIPE_API_KEY: ${STRIPE_API_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-test@example.com}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-test_password}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-test_sid}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-test_token}
+      TWILIO_PHONE_NUMBER: ${TWILIO_PHONE_NUMBER:-+1234567890}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    networks:
+      - platform-forge-network
+    volumes:
+      - app_data:/app/data
+    restart: unless-stopped
+
+networks:
+  platform-forge-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  app_data:

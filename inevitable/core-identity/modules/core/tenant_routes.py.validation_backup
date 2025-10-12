@@ -1,0 +1,404 @@
+"""
+API routes for tenant management
+"""
+from typing import List, Optional
+from datetime import datetime, timedelta
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+from pydantic import BaseModel, Field, EmailStr
+import secrets
+import string
+
+from .database import get_db
+from ..auth.dependencies import get_current_user, get_current_superuser
+from ..auth.models import User
+from .tenant_models import Tenant, TenantStatus, TenantPlan, TenantType, TenantSettings, TenantDomain
+from .tenant_service import TenantService
+
+router = APIRouter(prefix="/tenants", tags=["tenants"])
+
+
+class TenantCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    display_name: Optional[str] = None
+    slug: str = Field(..., pattern="^[a-z0-9-]+$", min_length=3, max_length=50)
+    admin_email: EmailStr
+    admin_name: str
+    company_name: Optional[str] = None
+    plan: TenantPlan = TenantPlan.FREE
+    tenant_type: TenantType = TenantType.SHARED
+
+
+class TenantUpdate(BaseModel):
+    display_name: Optional[str] = None
+    admin_email: Optional[EmailStr] = None
+    admin_name: Optional[str] = None
+    billing_email: Optional[EmailStr] = None
+    technical_email: Optional[EmailStr] = None
+    company_name: Optional[str] = None
+    industry: Optional[str] = None
+    size: Optional[str] = None
+    country: Optional[str] = Field(None, max_length=2)
+    timezone: Optional[str] = None
+
+
+class TenantResponse(BaseModel):
+    id: str
+    name: str
+    display_name: Optional[str]
+    slug: str
+    status: TenantStatus
+    plan: TenantPlan
+    tenant_type: TenantType
+    admin_email: str
+    company_name: Optional[str]
+    created_at: datetime
+    trial_ends_at: Optional[datetime]
+    custom_domain: Optional[str]
+    
+    class Config:
+        from_attributes = True
+
+
+class TenantLimits(BaseModel):
+    max_users: Optional[int] = Field(None, ge=1)
+    max_storage_gb: Optional[int] = Field(None, ge=1)
+    max_api_calls_per_hour: Optional[int] = Field(None, ge=100)
+    max_projects: Optional[int] = Field(None, ge=1)
+
+
+class DomainCreate(BaseModel):
+    domain: str = Field(..., pattern="^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\\.[a-zA-Z]{2,}$")
+    is_primary: bool = False
+
+
+@router.get("/", response_model=List[TenantResponse])
+async def list_tenants(
+    status: Optional[TenantStatus] = None,
+    plan: Optional[TenantPlan] = None,
+    search: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, le=1000),
+    current_user: User = Depends(get_current_superuser),
+    db: Session = Depends(get_db)
+):
+    """List all tenants (superuser only)"""
+    query = db.query(Tenant)
+    
+    if status:
+        query = query.filter(Tenant.status == status)
+    
+    if plan:
+        query = query.filter(Tenant.plan == plan)
+    
+    if search:
+        query = query.filter(
+            or_(
+                Tenant.name.ilike(f"%{search}%"),
+                Tenant.display_name.ilike(f"%{search}%"),
+                Tenant.company_name.ilike(f"%{search}%"),
+                Tenant.admin_email.ilike(f"%{search}%")
+            )
+        )
+    
+    tenants = query.offset(skip).limit(limit).all()
+    return tenants
+
+
+@router.get("/current", response_model=TenantResponse)
+async def get_current_tenant(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current user's tenant information"""
+    if not current_user.tenant_id:
+        raise HTTPException(404, "User has no tenant association")
+    
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    return tenant
+
+
+@router.get("/{tenant_id}", response_model=TenantResponse)
+async def get_tenant(
+    tenant_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get specific tenant information"""
+    # Users can only view their own tenant unless they're superuser
+    if not current_user.is_superuser and current_user.tenant_id != tenant_id:
+        raise HTTPException(403, "Access denied")
+    
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    return tenant
+
+
+@router.post("/", response_model=TenantResponse)
+async def create_tenant(
+    tenant_data: TenantCreate,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_superuser),
+    db: Session = Depends(get_db)
+):
+    """Create a new tenant (superuser only)"""
+    # Check if slug is already taken
+    existing = db.query(Tenant).filter(
+        or_(
+            Tenant.slug == tenant_data.slug,
+            Tenant.admin_email == tenant_data.admin_email
+        )
+    ).first()
+    
+    if existing:
+        raise HTTPException(400, "Tenant slug or admin email already exists")
+    
+    # Generate tenant ID
+    tenant_id = generate_tenant_id()
+    
+    # Create tenant
+    tenant = Tenant(
+        id=tenant_id,
+        name=tenant_data.name,
+        display_name=tenant_data.display_name or tenant_data.name,
+        slug=tenant_data.slug,
+        admin_email=tenant_data.admin_email,
+        admin_name=tenant_data.admin_name,
+        company_name=tenant_data.company_name,
+        plan=tenant_data.plan,
+        tenant_type=tenant_data.tenant_type,
+        status=TenantStatus.PROVISIONING
+    )
+    
+    # Set trial period for paid plans
+    if tenant_data.plan != TenantPlan.FREE:
+        tenant.trial_ends_at = datetime.utcnow() + timedelta(days=14)
+    
+    db.add(tenant)
+    
+    # Create default settings
+    settings = TenantSettings(
+        tenant_id=tenant_id,
+        app_settings={
+            "theme": "default",
+            "language": "en",
+            "date_format": "YYYY-MM-DD"
+        }
+    )
+    db.add(settings)
+    
+    db.commit()
+    db.refresh(tenant)
+    
+    # Provision tenant resources in background
+    background_tasks.add_task(
+        provision_tenant_resources,
+        tenant_id,
+        tenant_data.tenant_type
+    )
+    
+    return tenant
+
+
+@router.put("/{tenant_id}", response_model=TenantResponse)
+async def update_tenant(
+    tenant_id: str,
+    tenant_update: TenantUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update tenant information"""
+    # Users can only update their own tenant unless they're superuser
+    if not current_user.is_superuser and current_user.tenant_id != tenant_id:
+        raise HTTPException(403, "Access denied")
+    
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    # Update fields
+    for field, value in tenant_update.dict(exclude_unset=True).items():
+        setattr(tenant, field, value)
+    
+    db.commit()
+    db.refresh(tenant)
+    
+    return tenant
+
+
+@router.put("/{tenant_id}/limits")
+async def update_tenant_limits(
+    tenant_id: str,
+    limits: TenantLimits,
+    current_user: User = Depends(get_current_superuser),
+    db: Session = Depends(get_db)
+):
+    """Update tenant resource limits (superuser only)"""
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    # Update limits
+    for field, value in limits.dict(exclude_unset=True).items():
+        setattr(tenant, field, value)
+    
+    db.commit()
+    
+    return {"message": "Limits updated successfully"}
+
+
+@router.post("/{tenant_id}/suspend")
+async def suspend_tenant(
+    tenant_id: str,
+    reason: str = Query(..., description="Reason for suspension"),
+    current_user: User = Depends(get_current_superuser),
+    db: Session = Depends(get_db)
+):
+    """Suspend a tenant (superuser only)"""
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    if tenant.status == TenantStatus.SUSPENDED:
+        raise HTTPException(400, "Tenant is already suspended")
+    
+    tenant.status = TenantStatus.SUSPENDED
+    tenant.suspended_at = datetime.utcnow()
+    tenant.metadata["suspension_reason"] = reason
+    tenant.metadata["suspended_by"] = current_user.id
+    
+    db.commit()
+    
+    return {"message": "Tenant suspended successfully"}
+
+
+@router.post("/{tenant_id}/reactivate")
+async def reactivate_tenant(
+    tenant_id: str,
+    current_user: User = Depends(get_current_superuser),
+    db: Session = Depends(get_db)
+):
+    """Reactivate a suspended tenant (superuser only)"""
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    if tenant.status != TenantStatus.SUSPENDED:
+        raise HTTPException(400, "Tenant is not suspended")
+    
+    tenant.status = TenantStatus.ACTIVE
+    tenant.suspended_at = None
+    tenant.metadata["reactivated_by"] = current_user.id
+    tenant.metadata["reactivated_at"] = datetime.utcnow().isoformat()
+    
+    db.commit()
+    
+    return {"message": "Tenant reactivated successfully"}
+
+
+@router.post("/{tenant_id}/domains", response_model=dict)
+async def add_custom_domain(
+    tenant_id: str,
+    domain_data: DomainCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Add a custom domain to tenant"""
+    # Verify access
+    if not current_user.is_superuser and current_user.tenant_id != tenant_id:
+        raise HTTPException(403, "Access denied")
+    
+    # Check if domain already exists
+    existing = db.query(TenantDomain).filter(
+        TenantDomain.domain == domain_data.domain
+    ).first()
+    
+    if existing:
+        raise HTTPException(400, "Domain already registered")
+    
+    # Generate verification token
+    verification_token = generate_verification_token()
+    
+    # Create domain record
+    domain = TenantDomain(
+        tenant_id=tenant_id,
+        domain=domain_data.domain,
+        is_primary=domain_data.is_primary,
+        verification_token=verification_token
+    )
+    
+    db.add(domain)
+    db.commit()
+    
+    return {
+        "domain": domain_data.domain,
+        "verification_method": "DNS TXT",
+        "verification_record": f"_platformforge.{domain_data.domain}",
+        "verification_value": verification_token,
+        "status": "pending_verification"
+    }
+
+
+@router.get("/{tenant_id}/usage")
+async def get_tenant_usage(
+    tenant_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get tenant resource usage"""
+    # Verify access
+    if not current_user.is_superuser and current_user.tenant_id != tenant_id:
+        raise HTTPException(403, "Access denied")
+    
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    # Get current usage (simplified - in real implementation would query actual usage)
+    usage = {
+        "tenant_id": tenant_id,
+        "plan": tenant.plan,
+        "limits": {
+            "max_users": tenant.max_users,
+            "max_storage_gb": tenant.max_storage_gb,
+            "max_api_calls_per_hour": tenant.max_api_calls_per_hour,
+            "max_projects": tenant.max_projects
+        },
+        "current_usage": {
+            "users": db.query(User).filter(User.tenant_id == tenant_id).count(),
+            "storage_gb": 0,  # Would calculate from actual storage
+            "api_calls_this_hour": 0,  # Would calculate from logs
+            "projects": 0  # Would calculate from projects table
+        }
+    }
+    
+    return usage
+
+
+# Helper functions
+def generate_tenant_id() -> str:
+    """Generate a unique tenant ID"""
+    prefix = "tenant"
+    random_part = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    return f"{prefix}_{random_part}"
+
+
+def generate_verification_token() -> str:
+    """Generate a domain verification token"""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+
+
+async def provision_tenant_resources(tenant_id: str, tenant_type: TenantType):
+    """Background task to provision tenant resources"""
+    # This would handle:
+    # - Creating database/schema for DATABASE/SCHEMA type tenants
+    # - Setting up default data
+    # - Configuring infrastructure
+    # - Sending welcome emails
+    pass
