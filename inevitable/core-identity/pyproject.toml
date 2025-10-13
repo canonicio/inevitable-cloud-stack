@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core-identity"
+version = "0.1.0"
+description = "Shared authentication, session, and telemetry components for Inevitable products."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Inevitable", email = "team@inevitableco.ai"}
+]
+dependencies = [
+    "SQLAlchemy>=2.0",
+    "passlib>=1.7",
+    "python-jose[cryptography]>=3.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core_identity", "core_identity.*", "modules", "modules.*"]
