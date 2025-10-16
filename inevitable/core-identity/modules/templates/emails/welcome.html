@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Welcome to Platform Forge{% endblock %}
+{% block content %}
+<h2>Welcome, {{ user.name }}!</h2>
+<p>Thank you for joining Platform Forge. Your account has been created successfully.</p>
+<p>To get started, please verify your email address by clicking the button below:</p>
+<p style="text-align: center; margin: 30px 0;">
+    <a href="{{ verification_url }}" class="button">Verify Email Address</a>
+</p>
+<p>Or copy and paste this link into your browser:</p>
+<p style="word-break: break-all; color: #007bff;">{{ verification_url }}</p>
+<p>This link will expire in 24 hours.</p>
+<p>Best regards,<br>The Platform Forge Team</p>
+{% endblock %}

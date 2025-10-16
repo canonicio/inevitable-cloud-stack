@@ -12,6 +12,7 @@ import json
 import io
 
 from modules.core.database import get_db
+from modules.core.enhanced_validators import SecureBaseModel, APIParameterValidator
 from modules.auth.dependencies import get_current_user
 from modules.auth.models import User
 from .models import (
